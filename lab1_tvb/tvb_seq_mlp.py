@@ -249,7 +249,7 @@ if __name__ == "__main__":
     speed = 4.0         # signal speed in mm/ms
     freq = 1.0          # frequency parameter for the local dynamics
 
-    USE_SPARSE = False
+    USE_SPARSE = True
 
     T, Xs = simulate(W, D, N, M, dt, tf, speed, USE_SPARSE)
     plot.plot_xs(T, Xs, speed)

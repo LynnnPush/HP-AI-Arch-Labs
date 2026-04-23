@@ -112,22 +112,24 @@ def simulate(
     Xs = [[[0.0 for _ in range(total_timesteps)] for _ in range(M)] for _ in range(N)] # state variable list (M list of total_timesteps values for each N centers)
     D_timestep = [[int((D[i][j] / speed) / dt) for i in range(N)] for j in range(N)] # delay list in terms of timesteps
 
+    # set initial conditions (t=0) before starting the timer so initialization
+    # overhead is excluded from the simulation timing measurement
+    for n in range(N):
+        for m in range(M):
+            Xs[n][m][0] = -1.0
+
     c_duration = 0
 
     start = time.time()
-    for t in range(total_timesteps):
-        if t == 0:
-            for n in range(N):
-                for m in range(M):
-                    Xs[n][m][t] = -1.0
-        else:
-            for n in range(N):
-                c_start = time.time()
-                c_in = calculate_coupling(Xs, W[n], D_timestep[n], t, n)
-                c_duration += (time.time() - c_start)
-                X_new = step(Xs, t, n, c_in, dt, freq)
-                for m in range(M):
-                    Xs[n][m][t] = X_new[m]
+    for t in range(1, total_timesteps):  # start at 1; t=0 is pre-initialized above
+        for n in range(N):
+            # time only calculate_coupling to isolate its cost from step()
+            c_start = time.time()
+            c_in = calculate_coupling(Xs, W[n], D_timestep[n], t, n)
+            c_duration += (time.time() - c_start)
+            X_new = step(Xs, t, n, c_in, dt, freq)
+            for m in range(M):
+                Xs[n][m][t] = X_new[m]
     end = time.time()
 
     T = [t * dt for t in range(total_timesteps)]
@@ -139,17 +141,24 @@ def simulate(
     return T, Xs
 
 if __name__ == "__main__":
-    W, D = data.tvb76_weights_lengths()
-    W = W.tolist()      # weight matrix
-    D = D.tolist()      # distance matrix
-    N = len(W)          # number of centers
-    M = 2               # number of state variables per center
+    datasets = [
+        ("TVB-76",  data.tvb76_weights_lengths),
+        ("TVB-192", data.tvb192_weights_lengths),
+        ("TVB-998", data.tvb998_weights_lengths),
+    ]
 
     dt = 0.05           # timestep size for the simulation in ms
     tf = 150.0          # final timestep of the simulation in ms
     speed = 4.0         # signal speed in mm/ms
     freq = 1.0          # frequency parameter for the local dynamics
+    M = 2               # number of state variables per center
 
-    T, Xs = simulate(W, D, N, M, dt, tf, speed, freq)
-    plot.plot_xs(T, Xs, speed)
-    # plot.plot_delay_hist(D, W, speed)
+    for label, loader in datasets:
+        W, D = loader()
+        W = W.tolist()  # convert numpy arrays to Python lists for the pure-Python simulation
+        D = D.tolist()
+        N = len(W)
+        # zero out all distances so every delay collapses to 0 timesteps
+        D = [[0.0] * N for _ in range(N)]
+        print(f"\n=== {label} (N={N}, zero delays) ===")
+        T, Xs = simulate(W, D, N, M, dt, tf, speed, freq)
