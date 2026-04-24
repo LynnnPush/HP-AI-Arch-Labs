@@ -238,19 +238,20 @@ def simulate(
     return T, Xs
 
 if __name__ == "__main__":
-    W, D = data.tvb192_weights_lengths()
-    W = W.tolist()      # weight matrix
-    D = D.tolist()      # distance matrix
-    N = len(W)          # number of centers
-    M = 2               # number of state variables per center
+    dt = 0.05
+    tf = 15.0
+    speed = 4.0
+    M = 2
+    USE_SPARSE = False
 
-    dt = 0.05           # timestep size for the simulation in ms
-    tf = 15.0          # final timestep of the simulation in ms
-    speed = 4.0         # signal speed in mm/ms
-    freq = 1.0          # frequency parameter for the local dynamics
-
-    USE_SPARSE = True
-
-    T, Xs = simulate(W, D, N, M, dt, tf, speed, USE_SPARSE)
-    plot.plot_xs(T, Xs, speed)
-    # plot.plot_delay_hist(D, W, speed)
+    for label, loader in [
+        ("TVB-76",  data.tvb76_weights_lengths),
+        ("TVB-192", data.tvb192_weights_lengths),
+        ("TVB-998", data.tvb998_weights_lengths),
+    ]:
+        print(f"\n=== {label} ===")
+        W, D = loader()
+        W = W.tolist()
+        D = D.tolist()
+        N = len(W)
+        simulate(W, D, N, M, dt, tf, speed, USE_SPARSE)
