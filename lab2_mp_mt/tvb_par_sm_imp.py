@@ -78,7 +78,7 @@ def center_task(t, n, dt):
 
     return X_new
 
-def simulate(W, D, N, M, dt, tf, speed):
+def simulate(W, D, N, M, dt, tf, speed, chunksize=10):   # chunksize: tasks batched per worker call
     total_timesteps = int(tf/dt) # total number of timesteps the simulation must run
     Xs = np.zeros((N, M, total_timesteps)) # state variable list (M list of total_timesteps values for each N centers)
     D_timestep = ((D / speed) / dt).astype(int) # delay list in terms of timesteps
@@ -104,7 +104,7 @@ def simulate(W, D, N, M, dt, tf, speed):
                                                                 W_arr_shm.name, W_arr.shape, W_arr.dtype,
                                                                 D_arr_shm.name, D_arr.shape, D_arr.dtype)) as executor:
         for t in range(1, total_timesteps):
-            result = executor.map(center_task, [t]*N, range(N), [dt]*N, chunksize=10)
+            result = executor.map(center_task, [t]*N, range(N), [dt]*N, chunksize=chunksize)  # varied per dataset
             result = list(result)
             for n in range(N):
                 for m in range(M):
@@ -124,20 +124,85 @@ def simulate(W, D, N, M, dt, tf, speed):
     T = [t * dt for t in range(total_timesteps)]
 
     print(end-start)
-    
-    return T, Xs
+
+    return T, Xs, end - start
 
 if __name__ == "__main__":
-    W, D = data.tvb76_weights_lengths()
-    N = len(W)          # number of centers
-    M = 2               # number of state variables per center
+    import matplotlib.pyplot as plt
 
+    M = 2               # number of state variables per center
     dt = 0.05           # timestep size for the simulation in ms
     tf = 15.0           # final timestep of the simulation in ms
     speed = 4.0         # signal speed in mm/ms
-    freq = 1.0          # frequency parameter for the local dynamics
 
-    T, Xs = simulate(W, D, N, M, dt, tf, speed)
-    plot.plot_xs(T, Xs, speed)
+    # Optimal chunk sizes from tvb_par.py sweep
+    DATASETS = [
+        ("TVB76",  data.tvb76_weights_lengths,  57),
+        ("TVB192", data.tvb192_weights_lengths, 135),
+        ("TVB998", data.tvb998_weights_lengths, 125),
+    ]
+
+    # Known timings from prior runs at tf=15ms
+    seq_times      = {"TVB76": 0.78,  "TVB192": 2.65,  "TVB998": 45.34}
+    par_nosm_times = {"TVB76": 1.68,  "TVB192": 5.43,  "TVB998": None}
+    par_sm_times   = {"TVB76": 2.71,  "TVB192": 9.04,  "TVB998": 69.15}
+
+    par_sm_imp_times = {}   # this script (improved shared memory)
+
+    for label, loader, best_cs in DATASETS:
+        W, D = loader()
+        N = len(W)      # number of centers
+        print(f"\n=== {label} (N={N}) ===")
+
+        _, _, t_imp = simulate(W, D, N, M, dt, tf, speed, chunksize=best_cs)
+        par_sm_imp_times[label] = t_imp
+        print(f"  par_sm_imp (cs={best_cs}): {t_imp:.2f}s")
+
+    # --- comparison table ---
+    print("\n{:<8} {:>12} {:>12} {:>12} {:>14}".format(
+        "Dataset", "Sequential", "Par (no SM)", "Par (SM)", "Par (SM imp)"))
+    print("-" * 62)
+    for label in ["TVB76", "TVB192", "TVB998"]:
+        seq  = f"{seq_times[label]:.2f}s"
+        nosm = f"{par_nosm_times[label]:.2f}s" if par_nosm_times[label] else "N/A"
+        sm   = f"{par_sm_times[label]:.2f}s"
+        imp  = f"{par_sm_imp_times[label]:.2f}s"
+        print(f"{label:<8} {seq:>12} {nosm:>12} {sm:>12} {imp:>14}")
+
+    # --- bar chart comparison ---
+    labels   = ["TVB76", "TVB192", "TVB998"]
+    x        = np.arange(len(labels))
+    width    = 0.2
+
+    seq_vals  = [seq_times[l]                                           for l in labels]
+    nosm_vals = [par_nosm_times[l] if par_nosm_times[l] else 0         for l in labels]
+    sm_vals   = [par_sm_times[l]                                        for l in labels]
+    imp_vals  = [par_sm_imp_times[l]                                    for l in labels]
+
+    fig, ax = plt.subplots(figsize=(11, 5))
+    b1 = ax.bar(x - 1.5*width, seq_vals,  width, label='Sequential',   color='#7f7f7f')
+    b2 = ax.bar(x - 0.5*width, nosm_vals, width, label='Par (no SM)',  color='#1f77b4')
+    b3 = ax.bar(x + 0.5*width, sm_vals,   width, label='Par (SM)',     color='#2ca02c')
+    b4 = ax.bar(x + 1.5*width, imp_vals,  width, label='Par (SM imp)', color='#d62728')
+
+    for bars in (b1, b2, b3, b4):
+        for bar in bars:
+            h = bar.get_height()
+            if h > 0:
+                ax.text(bar.get_x() + bar.get_width()/2, h + 0.5,
+                        f"{h:.1f}s", ha='center', va='bottom', fontsize=7)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=12)
+    ax.set_ylabel("Execution Time (s)", fontsize=12)
+    ax.set_title(f"TVB Simulation: Sequential vs Parallel variants (tf={tf}ms)", fontsize=12)
+    ax.legend(fontsize=10)
+    ax.grid(axis='y', alpha=0.3)
+
+    plt.tight_layout()
+    save_path = "comparison_sm_imp.png"
+    plt.savefig(save_path, dpi=150)
+    plt.show()
+    print(f"\nPlot saved to {save_path}")
     # plot.plot_delay_hist(D, W, speed)
     

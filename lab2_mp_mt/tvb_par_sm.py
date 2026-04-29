@@ -75,7 +75,7 @@ def center_task(Xs_shm_name, Xs_shape, Xs_dtype, W_shm_name, W_shape, W_dtype, D
 
     return X_new
 
-def simulate(W, D, N, M, dt, tf, speed):
+def simulate(W, D, N, M, dt, tf, speed, chunksize=1):   # chunksize: tasks batched per worker call
     total_timesteps = int(tf/dt) # total number of timesteps the simulation must run
     Xs = np.zeros((N, M, total_timesteps)) # state variable list (M list of total_timesteps values for each N centers)
     D_timestep = ((D / speed) / dt).astype(int) # delay list in terms of timesteps
@@ -99,7 +99,7 @@ def simulate(W, D, N, M, dt, tf, speed):
     start = time.time()
     with ProcessPoolExecutor() as executor:
         for t in range(1, total_timesteps):
-            result = executor.map(center_task, [Xs_shm.name]*N, [Xs_shared.shape]*N, [Xs_shared.dtype]*N, [W_shm.name]*N, [W_shared.shape]*N, [W_shared.dtype]*N, [D_shm.name]*N, [D_shared.shape]*N, [D_shared.dtype]*N, [t]*N, range(N), [dt]*N, chunksize=40)
+            result = executor.map(center_task, [Xs_shm.name]*N, [Xs_shared.shape]*N, [Xs_shared.dtype]*N, [W_shm.name]*N, [W_shared.shape]*N, [W_shared.dtype]*N, [D_shm.name]*N, [D_shared.shape]*N, [D_shared.dtype]*N, [t]*N, range(N), [dt]*N, chunksize=chunksize)
             result = list(result)
             for n in range(N):
                 for m in range(M):
@@ -119,20 +119,108 @@ def simulate(W, D, N, M, dt, tf, speed):
     T = [t * dt for t in range(total_timesteps)]
 
     print(end-start)
-    
-    return T, Xs
+
+    return T, Xs, end - start
+
 
 if __name__ == "__main__":
-    W, D = data.tvb76_weights_lengths()
-    N = len(W)          # number of centers
-    M = 2               # number of state variables per center
+    import sys, matplotlib.pyplot as plt
 
+    # Import MLP sequential implementation from lab1
+    sys.path.insert(0, '/home/ubuntu/Labs/lab1_tvb')
+    import tvb_seq_mlp
+    sys.path.pop(0)
+
+    M = 2               # number of state variables per center
     dt = 0.05           # timestep size for the simulation in ms
     tf = 15.0           # final timestep of the simulation in ms
     speed = 4.0         # signal speed in mm/ms
     freq = 1.0          # frequency parameter for the local dynamics
 
-    T, Xs = simulate(W, D, N, M, dt, tf, speed)
-    plot.plot_xs(T, Xs, speed)
+    # Optimal chunk sizes from tvb_par.py sweep; TVB998 found via sweep below
+    DATASETS = [
+        ("TVB76",  data.tvb76_weights_lengths,  57),
+        ("TVB192", data.tvb192_weights_lengths, 135),
+        ("TVB998", data.tvb998_weights_lengths,  None),
+    ]
+
+    # Known tvb_par.py (no shared memory) timings at optimal chunksize, tf=15ms
+    par_nosm_times = {"TVB76": 1.68, "TVB192": 5.43, "TVB998": None}
+
+    seq_times    = {}   # sequential MLP baseline
+    par_sm_times = {}   # this script (shared memory)
+
+    for label, loader, best_cs in DATASETS:
+        W, D = loader()
+        N = len(W)      # number of centers
+        print(f"\n=== {label} (N={N}) ===")
+
+        # --- find optimal chunksize for TVB998 via a small sweep ---
+        if best_cs is None:
+            sweep_cs = [125, 250, 500, 750]  # covers N/8 to 3N/4
+            sweep_times = []
+            for cs in sweep_cs:
+                _, _, t = simulate(W, D, N, M, dt, tf, speed, chunksize=cs)
+                print(f"  sweep chunksize={cs}: {t:.2f}s")
+                sweep_times.append(t)
+            best_cs = sweep_cs[int(np.argmin(sweep_times))]
+            print(f"  -> best chunksize for {label}: {best_cs}")
+
+        # --- parallel shared-memory run at optimal chunksize ---
+        _, _, t_sm = simulate(W, D, N, M, dt, tf, speed, chunksize=best_cs)
+        par_sm_times[label] = t_sm
+        print(f"  par_sm (cs={best_cs}): {t_sm:.2f}s")
+
+        # --- sequential MLP baseline ---
+        W_list = W.tolist()
+        D_list = D.tolist()
+        t0 = time.time()
+        tvb_seq_mlp.simulate(W_list, D_list, N, M, dt, tf, speed, False)
+        seq_times[label] = time.time() - t0
+        print(f"  sequential       : {seq_times[label]:.2f}s")
+
+    # --- comparison table ---
+    print("\n{:<8} {:>12} {:>12} {:>12}".format("Dataset", "Sequential", "Par (no SM)", "Par (SM)"))
+    print("-" * 48)
+    for label in ["TVB76", "TVB192", "TVB998"]:
+        seq  = f"{seq_times[label]:.2f}s"      if seq_times[label]      else "N/A"
+        nosm = f"{par_nosm_times[label]:.2f}s" if par_nosm_times[label] else "N/A"
+        sm   = f"{par_sm_times[label]:.2f}s"
+        print(f"{label:<8} {seq:>12} {nosm:>12} {sm:>12}")
+
+    # --- bar chart comparison ---
+    labels    = ["TVB76", "TVB192", "TVB998"]
+    x         = np.arange(len(labels))
+    width     = 0.25
+
+    seq_vals  = [seq_times[l]      if seq_times[l]      else 0 for l in labels]
+    nosm_vals = [par_nosm_times[l] if par_nosm_times[l] else 0 for l in labels]
+    sm_vals   = [par_sm_times[l]                               for l in labels]
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    b1 = ax.bar(x - width, seq_vals,  width, label='Sequential',  color='#7f7f7f')
+    b2 = ax.bar(x,         nosm_vals, width, label='Par (no SM)', color='#1f77b4')
+    b3 = ax.bar(x + width, sm_vals,   width, label='Par (SM)',    color='#2ca02c')
+
+    # Annotate bars with timing values
+    for bars in (b1, b2, b3):
+        for bar in bars:
+            h = bar.get_height()
+            if h > 0:
+                ax.text(bar.get_x() + bar.get_width()/2, h + 0.3,
+                        f"{h:.1f}s", ha='center', va='bottom', fontsize=8)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=12)
+    ax.set_ylabel("Execution Time (s)", fontsize=12)
+    ax.set_title(f"TVB Simulation: Sequential vs Parallel (tf={tf}ms)", fontsize=12)
+    ax.legend(fontsize=10)
+    ax.grid(axis='y', alpha=0.3)
+
+    plt.tight_layout()
+    save_path = "comparison_sm.png"
+    plt.savefig(save_path, dpi=150)
+    plt.show()
+    print(f"\nPlot saved to {save_path}")
     # plot.plot_delay_hist(D, W, speed)
     
