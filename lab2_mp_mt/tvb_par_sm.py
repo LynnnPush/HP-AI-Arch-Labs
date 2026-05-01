@@ -137,11 +137,13 @@ if __name__ == "__main__":
     speed = 4.0         # signal speed in mm/ms
     freq = 1.0          # frequency parameter for the local dynamics
 
-    # Optimal chunk sizes from tvb_par.py sweep; TVB998 found via sweep below
+    # Reuse the chunksize sweep from tvb_par.py, but with this script's shared-memory simulate
+    from tvb_par import sweep_chunksizes
+
     DATASETS = [
-        ("TVB76",  data.tvb76_weights_lengths,  57),
-        ("TVB192", data.tvb192_weights_lengths, 135),
-        ("TVB998", data.tvb998_weights_lengths,  None),
+        ("TVB76",  data.tvb76_weights_lengths),
+        ("TVB192", data.tvb192_weights_lengths),
+        ("TVB998", data.tvb998_weights_lengths),
     ]
 
     # Known tvb_par.py (no shared memory) timings at optimal chunksize, tf=15ms
@@ -150,21 +152,15 @@ if __name__ == "__main__":
     seq_times    = {}   # sequential MLP baseline
     par_sm_times = {}   # this script (shared memory)
 
-    for label, loader, best_cs in DATASETS:
+    for label, loader in DATASETS:
         W, D = loader()
         N = len(W)      # number of centers
         print(f"\n=== {label} (N={N}) ===")
 
-        # --- find optimal chunksize for TVB998 via a small sweep ---
-        if best_cs is None:
-            sweep_cs = [125, 250, 500, 750]  # covers N/8 to 3N/4
-            sweep_times = []
-            for cs in sweep_cs:
-                _, _, t = simulate(W, D, N, M, dt, tf, speed, chunksize=cs)
-                print(f"  sweep chunksize={cs}: {t:.2f}s")
-                sweep_times.append(t)
-            best_cs = sweep_cs[int(np.argmin(sweep_times))]
-            print(f"  -> best chunksize for {label}: {best_cs}")
+        # --- find optimal chunksize via shared-memory sweep (reused from tvb_par.py) ---
+        chunk_sizes, sweep_times = sweep_chunksizes(W, D, N, M, dt, tf, speed, label, simulate_fn=simulate)
+        best_cs = chunk_sizes[int(np.argmin(sweep_times))]
+        print(f"  -> best chunksize for {label}: {best_cs}")
 
         # --- parallel shared-memory run at optimal chunksize ---
         _, _, t_sm = simulate(W, D, N, M, dt, tf, speed, chunksize=best_cs)

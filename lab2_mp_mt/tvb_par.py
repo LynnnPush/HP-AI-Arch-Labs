@@ -97,19 +97,39 @@ def sweep_tf(W, D, N, M, dt, tf_values, speed, chunksize, label):
     return times
 
 
-def sweep_chunksizes(W, D, N, M, dt, tf, speed, label):
-    # Log-spaced chunk sizes from 2 to N, always including N itself
+def sweep_chunksizes(W, D, N, M, dt, tf, speed, label, simulate_fn=None, early_stop_streak=3):
+    # Log-spaced chunk sizes from 2 to N, always including N itself.
+    # Early stop: once the running min has been seen, abort after `early_stop_streak`
+    # consecutive strictly-increasing samples (trend is clear; remaining cs only get worse).
+    if simulate_fn is None:
+        simulate_fn = simulate
     raw = np.geomspace(2, N, num=14, dtype=int)
     chunk_sizes = sorted(set(raw.tolist() + [N]))
 
     times = []
+    tested_cs = []
+    best_t = float('inf')
+    increasing_streak = 0
     print(f"\n--- {label} (N={N}) ---")
     for cs in chunk_sizes:
-        _, _, elapsed = simulate(W, D, N, M, dt, tf, speed, chunksize=cs)
+        _, _, elapsed = simulate_fn(W, D, N, M, dt, tf, speed, chunksize=cs)
         print(f"  chunksize={cs:4d}: {elapsed:.2f}s")
         times.append(elapsed)
+        tested_cs.append(cs)
 
-    return chunk_sizes, times
+        if elapsed < best_t:
+            best_t = elapsed
+            increasing_streak = 0
+        elif len(times) >= 2 and elapsed > times[-2]:
+            increasing_streak += 1
+        else:
+            increasing_streak = 0
+
+        if increasing_streak >= early_stop_streak:
+            print(f"  early stop: {increasing_streak} consecutive increases past min")
+            break
+
+    return tested_cs, times
 
 if __name__ == "__main__":
     M = 2               # number of state variables per center

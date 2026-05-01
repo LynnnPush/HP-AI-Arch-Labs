@@ -135,28 +135,34 @@ if __name__ == "__main__":
     tf = 15.0           # final timestep of the simulation in ms
     speed = 4.0         # signal speed in mm/ms
 
-    # Optimal chunk sizes from tvb_par.py sweep
+    # Reuse the chunksize sweep from tvb_par.py with this script's improved SM simulate
+    from tvb_par import sweep_chunksizes
+
     DATASETS = [
-        ("TVB76",  data.tvb76_weights_lengths,  57),
-        ("TVB192", data.tvb192_weights_lengths, 135),
-        ("TVB998", data.tvb998_weights_lengths, 125),
+        ("TVB76",  data.tvb76_weights_lengths),
+        ("TVB192", data.tvb192_weights_lengths),
+        ("TVB998", data.tvb998_weights_lengths),
     ]
 
     # Known timings from prior runs at tf=15ms
     seq_times      = {"TVB76": 0.78,  "TVB192": 2.65,  "TVB998": 45.34}
     par_nosm_times = {"TVB76": 1.68,  "TVB192": 5.43,  "TVB998": None}
-    par_sm_times   = {"TVB76": 2.71,  "TVB192": 9.04,  "TVB998": 69.15}
+    par_sm_times   = {"TVB76": 1.11,  "TVB192": 3.70,  "TVB998": 69.69}
 
     par_sm_imp_times = {}   # this script (improved shared memory)
+    best_cs_imp      = {}
 
-    for label, loader, best_cs in DATASETS:
+    for label, loader in DATASETS:
         W, D = loader()
         N = len(W)      # number of centers
         print(f"\n=== {label} (N={N}) ===")
 
-        _, _, t_imp = simulate(W, D, N, M, dt, tf, speed, chunksize=best_cs)
-        par_sm_imp_times[label] = t_imp
-        print(f"  par_sm_imp (cs={best_cs}): {t_imp:.2f}s")
+        chunk_sizes, sweep_times = sweep_chunksizes(W, D, N, M, dt, tf, speed, label, simulate_fn=simulate)
+        best_cs = chunk_sizes[int(np.argmin(sweep_times))]
+        best_t  = min(sweep_times)
+        best_cs_imp[label] = best_cs
+        par_sm_imp_times[label] = best_t
+        print(f"  -> best chunksize for {label}: {best_cs} ({best_t:.2f}s)")
 
     # --- comparison table ---
     print("\n{:<8} {:>12} {:>12} {:>12} {:>14}".format(
