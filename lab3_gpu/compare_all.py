@@ -48,6 +48,18 @@ try:
 except (ImportError, ModuleNotFoundError):
     print("[warn] CuPy not available — skipping GPU implementation.")
 
+# ── GPU warmup ────────────────────────────────────────────────────────────────
+# CuPy compiles CUDA kernels via NVRTC on first call and caches the .cubin.
+# Run a throwaway simulation on a tiny dataset before any timed runs so that
+# kernel compilation cost is excluded from all wall-clock measurements.
+for label, simulate_fn, is_gpu in impls:
+    if is_gpu:
+        _W, _D = data.tvb76_weights_lengths()
+        _N = len(_W)
+        simulate_fn(_W, _D, _N, M, dt, tf, speed)
+        print("[info] GPU warmup complete.")
+        break
+
 # ── Run ───────────────────────────────────────────────────────────────────────
 # results[impl_label][dataset_name] = (wall_time, Xs_cpu)
 results = {label: {} for label, _, _ in impls}

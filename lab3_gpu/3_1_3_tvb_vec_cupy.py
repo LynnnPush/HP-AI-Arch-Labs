@@ -131,18 +131,7 @@ def simulate(
     # Allocate full state history buffer on GPU
     Xs = cp.zeros((N, M, total_timesteps), dtype=cp.float64)
 
-    # Warmup: run two timesteps and discard to trigger CUDA kernel compilation
-    # (CuPy compiles kernels via NVRTC on first call and caches the .cubin).
-    # Without this, the first dataset absorbs compilation cost (~seconds) that
-    # is not representative of steady-state GPU performance.
-    Xs[:, :, 0] = -1.0
-    _c = calculate_coupling(Xs, W_gpu, D_timestep_gpu, 1)
-    Xs[:, :, 1] = step(Xs, 1, _c, dt)
-    cp.cuda.Stream.null.synchronize()
-    Xs[:] = 0.0   # reset state before the real timed run
-    del _c
-
-    # Synchronize so the timer starts only after all uploads and warmup are done
+    # Synchronize so the timer starts only after all uploads are done
     cp.cuda.Stream.null.synchronize()
     start = time.time()
 
