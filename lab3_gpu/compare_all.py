@@ -37,12 +37,12 @@ mod = importlib.import_module("tvb_vec")
 impls.append(("node_loop", mod.simulate, False))
 
 # Step 2: fully vectorized NumPy
-mod = importlib.import_module("3_1_2_tvb_vec_numpyNode")
+mod = importlib.import_module("L3_Q1_2_tvb_vec_numpyNode")
 impls.append(("numpy_vec", mod.simulate, False))
 
 # Step 3: CuPy GPU — skip gracefully if CUDA not available
 try:
-    mod = importlib.import_module("3_1_3_tvb_vec_cupy")
+    mod = importlib.import_module("L3_Q1_3_tvb_vec_cupy")
     impls.append(("cupy_gpu", mod.simulate, True))
     print("[info] CuPy found — GPU implementation will run.")
 except (ImportError, ModuleNotFoundError):
