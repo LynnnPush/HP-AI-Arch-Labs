@@ -16,6 +16,12 @@ print(jax.devices())
 x_train, x_test = x_train / 255.0, x_test / 255.0  # Normalize
 x_train, x_test = x_train.reshape(-1, 784), x_test.reshape(-1, 784)  # Flatten
 
+# pre-move to device so the per-step slicing stays on GPU
+x_train_j = jnp.array(x_train)
+y_train_j = jnp.array(y_train)
+x_test_j = jnp.array(x_test)
+y_test_j = jnp.array(y_test)
+
 
 class MLP(nn.Module):
     dropout_rate: float = 0.3
@@ -32,14 +38,8 @@ class MLP(nn.Module):
         return x
 
 
-key = random.PRNGKey(10)
 model = MLP()
-params = model.init(key, jnp.ones([1, 784]), train=True)[
-    "params"
-]  # jnp.ones is provided as dummy input to define the input shape to the model
 optimizer = optax.adamw(learning_rate=1e-3, weight_decay=1e-4)
-
-opt_state = optimizer.init(params)
 
 
 @jax.jit
@@ -74,37 +74,87 @@ def training_step(
     return params, opt_state, loss_value
 
 
-untrained_accuracy = accuracy(params, jnp.array(x_test), jnp.array(y_test))
-print("Untrained model accuracy:", untrained_accuracy)
-
-
+# multi-seed sweep configuration
+SEEDS = (10, 42, 2024)
+NUM_EPOCHS = 10
 BATCH_SIZE = 128
-for epoch in range(50):
-    for i in (pbar := tqdm(range(0, len(x_train), BATCH_SIZE), desc=f"Epoch {epoch}")):
-        key, subkey = random.split(key)
 
-        params, opt_state, train_loss = training_step(
-            params,
-            opt_state,
-            x_train[i : i + BATCH_SIZE],
-            y_train[i : i + BATCH_SIZE],
-            subkey,
-        )
+results = {}
 
-        if i % (BATCH_SIZE * 5) == 0:
-            pbar.set_postfix(
-                {
-                    "EPOCH": epoch,
-                    "STEP": i,
-                    "TRAIN LOSS": jnp.mean(
-                        loss(params, x_train[:1000], y_train[:1000], subkey)
-                    ),
-                    "TEST ACCURACY": accuracy(
-                        params, jnp.array(x_test), jnp.array(y_test)
-                    ),
-                }
+for seed in SEEDS:
+    print("\n" + "=" * 70)
+    print(f"Run with seed = {seed}  (epochs = {NUM_EPOCHS}, batch = {BATCH_SIZE})")
+    print("=" * 70)
+
+    # seed controls both weight init and the dropout RNG stream
+    key = random.PRNGKey(seed)
+    init_key, key = random.split(key)
+    params = model.init(init_key, jnp.ones([1, 784]), train=True)["params"]
+    opt_state = optimizer.init(params)
+
+    print("Untrained model accuracy:", accuracy(params, x_test_j, y_test_j))
+
+    epoch_test_acc = []
+    for epoch in range(NUM_EPOCHS):
+        for i in (pbar := tqdm(range(0, len(x_train), BATCH_SIZE), desc=f"Seed {seed} Epoch {epoch}")):
+            key, subkey = random.split(key)
+
+            params, opt_state, train_loss = training_step(
+                params,
+                opt_state,
+                x_train_j[i : i + BATCH_SIZE],
+                y_train_j[i : i + BATCH_SIZE],
+                subkey,
             )
 
-test_accuracy = accuracy(params, jnp.array(x_test), jnp.array(y_test))
-train_accuracy = accuracy(params, jnp.array(x_train), jnp.array(y_train))
-print("Test accuracy:", test_accuracy, "Train accuracy", train_accuracy)
+            if i % (BATCH_SIZE * 5) == 0:
+                pbar.set_postfix(
+                    {
+                        "TRAIN LOSS": float(loss(params, x_train_j[:1000], y_train_j[:1000], subkey)),
+                        "TEST ACC": float(accuracy(params, x_test_j, y_test_j)),
+                    }
+                )
+
+        # end-of-epoch test accuracy for the summary table
+        epoch_acc = float(accuracy(params, x_test_j, y_test_j))
+        epoch_test_acc.append(epoch_acc)
+        print(f"  end of epoch {epoch}: test accuracy = {epoch_acc:.2f}%")
+
+    test_accuracy = float(accuracy(params, x_test_j, y_test_j))
+    train_accuracy = float(accuracy(params, x_train_j, y_train_j))
+    print(f"Seed {seed}  Test: {test_accuracy:.2f}%  Train: {train_accuracy:.2f}%")
+
+    results[seed] = {
+        "epoch_test_acc": epoch_test_acc,
+        "final_test_acc": test_accuracy,
+        "final_train_acc": train_accuracy,
+    }
+
+
+# summary table for easy reporting
+print("\n" + "=" * 70)
+print(f"SUMMARY: test accuracy per epoch across {len(SEEDS)} seeds")
+print("=" * 70)
+header = "Epoch | " + " | ".join(f"seed={s:<6}" for s in SEEDS) + " | mean"
+print(header)
+print("-" * len(header))
+for epoch in range(NUM_EPOCHS):
+    vals = [results[s]["epoch_test_acc"][epoch] for s in SEEDS]
+    mean_v = sum(vals) / len(vals)
+    row = f"{epoch:>5} | " + " | ".join(f"{v:>10.2f}%" for v in vals) + f" | {mean_v:>5.2f}%"
+    print(row)
+
+print("\nFinal results:")
+print(f"{'Seed':<8} {'Train acc':>12} {'Test acc':>12}")
+for s in SEEDS:
+    print(f"{s:<8} {results[s]['final_train_acc']:>11.2f}% {results[s]['final_test_acc']:>11.2f}%")
+
+# aggregate stats across seeds — quantifies run-to-run variability
+final_tests = [results[s]["final_test_acc"] for s in SEEDS]
+final_trains = [results[s]["final_train_acc"] for s in SEEDS]
+mean_test = sum(final_tests) / len(final_tests)
+mean_train = sum(final_trains) / len(final_trains)
+spread_test = max(final_tests) - min(final_tests)
+spread_train = max(final_trains) - min(final_trains)
+print(f"\nMean final test  accuracy: {mean_test:.2f}%  (spread = {spread_test:.2f} pp)")
+print(f"Mean final train accuracy: {mean_train:.2f}%  (spread = {spread_train:.2f} pp)")
