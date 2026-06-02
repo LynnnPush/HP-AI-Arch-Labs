@@ -57,6 +57,10 @@ import io_model
 # ---------------------------------------------------------------------------
 BACKENDS = ("baseline", "vec", "jit", "vec_jit", "mp_intra")
 _JIT_BACKENDS = {"jit", "vec_jit"}
+# Backends whose simulate(...) accepts the local (k-nearest-neighbour) gap-junction
+# args (use_knn, neighbours). Only the scalar-njit jit backend implements it; the
+# others always use all-to-all coupling regardless of the --knn flag.
+_KNN_BACKENDS = {"jit"}
 # mp_intra is special: it is NOT a module.simulate(...) backend. It splits one
 # sim's cells across processes, building its OWN shared-memory state and spawning
 # workers, so it has no entry here and is driven by _step_intra (not
@@ -110,9 +114,11 @@ PARAM_SPECS = {
         "help": "Time-step duration in seconds.",
     },
     "n_cells": {
-        "values": [1, 2, 10, 30, 100, 1000],
+        "values": [1, 2, 10, 30, 100, 1000, 2000, 5000],
         "overrides": {},
-        "help": "Cell population size.",
+        "help": "Cell population size. Values >~4000 go unstable with all-to-all "
+                "gap junctions (--no-knn) but stay stable under local --knn coupling. "
+                "Use an optimized --backend (e.g. jit) for the large values.",
     },
     "enable_gapjunctions": {
         "values": [True, False],
@@ -212,7 +218,8 @@ def _step_baseline(cfg, st, n_cells, n_simsteps, delta):
     return time.perf_counter() - wall_tic, time.process_time() - cpu_tic
 
 
-def _step_optimized(simulate, cfg, st, n_cells, n_simsteps, delta, record_every):
+def _step_optimized(simulate, cfg, st, n_cells, n_simsteps, delta, record_every,
+                    use_knn=False, neighbours=None):
     """Drive an optimized backend's simulate(...) once and return
     (wall_time, cpu_time). All four optimized signatures share the positional
     order (enable_gapjunctions, I_app, I_pulse10ms, record, record_every).
@@ -221,9 +228,14 @@ def _step_optimized(simulate, cfg, st, n_cells, n_simsteps, delta, record_every)
     region, then discard it), but only every `record_every` steps so the buffer
     stays bounded -- the dense (n_simsteps, n_cells, 4) trace is what blows up at
     large n_cells (e.g. 100k steps x 10k cells x 4 x 8 B ~= 32 GB). record_every
-    <= 0 disables recording entirely for the very largest runs."""
+    <= 0 disables recording entirely for the very largest runs.
+
+    `use_knn`/`neighbours` select local gap-junction coupling. They are passed as
+    keyword args only when use_knn is set, so backends whose simulate(...) lacks
+    them (everything except jit) keep their original positional-only signature."""
     record = record_every > 0
     stride = record_every if record else 1
+    knn_kwargs = {"use_knn": True, "neighbours": neighbours} if use_knn else {}
 
     wall_tic = time.perf_counter()
     cpu_tic = time.process_time()
@@ -235,6 +247,7 @@ def _step_optimized(simulate, cfg, st, n_cells, n_simsteps, delta, record_every)
         st["dend_Ca2Plus"], st["dend_Calcium_r"], st["dend_Potassium_s"], st["dend_Hcurrent_q"],
         st["g_CaL"], n_cells, n_simsteps, delta, cfg["sim_seconds"],
         cfg["enable_gapjunctions"], 0.0, cfg["I_pulse10ms"], record, stride,
+        **knn_kwargs,
     )
 
     return time.perf_counter() - wall_tic, time.process_time() - cpu_tic
@@ -271,7 +284,7 @@ def _step_intra(cfg, n_cells, delta, record_every, workers, seed):
 
 
 def run_once(cfg, seed, backend="baseline", simulate=None, record_every=40,
-             workers=None):
+             workers=None, use_knn=False, k=8):
     """Run a single simulation with the given config dict and return metrics.
 
     `backend` selects the io_model implementation ("baseline" or one of the
@@ -279,14 +292,18 @@ def run_once(cfg, seed, backend="baseline", simulate=None, record_every=40,
     an optimized backend (see resolve_backend) and is ignored for the baseline.
     `record_every` is the optimized-backend trace stride (<=0 disables recording;
     the baseline always records densely, as in the reference). `workers` is the
-    process count for the mp_intra backend (ignored otherwise). The seeded initial
-    state is built (and excluded from timing) the same way for every backend so
-    results are apples-to-apples.
+    process count for the mp_intra backend (ignored otherwise). `use_knn`/`k`
+    request local gap-junction coupling (each cell coupled to its `k` nearest
+    neighbours); this only takes effect on a backend in _KNN_BACKENDS, otherwise
+    the run falls back to all-to-all. The seeded initial state is built (and
+    excluded from timing) the same way for every backend so results are
+    apples-to-apples.
     """
     sim_seconds = cfg["sim_seconds"]
     delta = cfg["delta"]
     n_cells = cfg["n_cells"]
     n_simsteps = int(sim_seconds * 1000 / delta + 0.5)
+    effective_knn = use_knn and backend in _KNN_BACKENDS
 
     if backend == "mp_intra":
         # Builds its own shared-memory state from the seed -> no pre-built st here.
@@ -296,7 +313,16 @@ def run_once(cfg, seed, backend="baseline", simulate=None, record_every=40,
         if backend == "baseline":
             wall_time, cpu_time = _step_baseline(cfg, st, n_cells, n_simsteps, delta)
         else:
-            wall_time, cpu_time = _step_optimized(simulate, cfg, st, n_cells, n_simsteps, delta, record_every)
+            neighbours = None
+            if effective_knn:
+                # Adjacency is built once here (outside the timed region) and reused
+                # every step. Positions are seeded so the topology is reproducible.
+                import io_model_jit
+                pos_seed = seed if seed is not None else 1981
+                neighbours = io_model_jit.build_neighbours(n_cells, k=k, seed=pos_seed)
+            wall_time, cpu_time = _step_optimized(
+                simulate, cfg, st, n_cells, n_simsteps, delta, record_every,
+                effective_knn, neighbours)
 
     total_cell_steps = n_simsteps * n_cells
 
@@ -319,12 +345,12 @@ def run_once(cfg, seed, backend="baseline", simulate=None, record_every=40,
 
 
 def run_repeated(cfg, repeats, seed, backend="baseline", simulate=None,
-                 record_every=40, workers=None):
+                 record_every=40, workers=None, use_knn=False, k=8):
     """Run a config `repeats` times; keep the fastest (lowest wall time) run."""
     best = None
     all_wall = []
     for _ in range(repeats):
-        m = run_once(cfg, seed, backend, simulate, record_every, workers)
+        m = run_once(cfg, seed, backend, simulate, record_every, workers, use_knn, k)
         all_wall.append(m["wall_time_s"])
         if best is None or m["wall_time_s"] < best["wall_time_s"]:
             best = m
@@ -404,6 +430,17 @@ def main():
                         help="Process count for --backend mp_intra (one sim's "
                              "cells split across W workers). Default: os.cpu_count(). "
                              "Ignored by the other backends.")
+    parser.add_argument("--knn", action=argparse.BooleanOptionalAction, default=True,
+                        help="Local gap-junction coupling: each cell couples only to "
+                             "its --k nearest neighbours instead of all cells. This is "
+                             "the DEFAULT and stays stable at large n_cells. Pass "
+                             "--no-knn for the original all-to-all coupling (which goes "
+                             "unstable above ~4000 cells). Only the jit backend "
+                             "supports this; other backends always use all-to-all.")
+    parser.add_argument("--k", type=int, default=8, metavar="K",
+                        help="Number of nearest neighbours each cell couples to under "
+                             "--knn (default: 8). Fixed regardless of n_cells, which is "
+                             "what keeps large populations stable.")
     parser.add_argument("--seed", type=int, default=1981,
                         help="RNG seed for reproducible initial state (default: 1981). "
                              "Use -1 for non-deterministic runs.")
@@ -441,18 +478,29 @@ def main():
     # njit-compiled backends, do a tiny throwaway run first so JIT compilation
     # is not charged to the first swept config's timing.
     simulate = resolve_backend(args.backend)
+
+    # Local kNN coupling only exists on the jit backend; warn (once) if requested
+    # elsewhere so the all-to-all fallback is not a silent surprise.
+    if args.knn and args.backend not in _KNN_BACKENDS:
+        print(f"note: --knn applies only to the {'/'.join(sorted(_KNN_BACKENDS))} "
+              f"backend; '{args.backend}' uses all-to-all gap-junction coupling.\n")
+
     if args.backend in _JIT_BACKENDS:
         print(f"Warming up '{args.backend}' (JIT compilation)...")
         warm = make_config(selected[0], PARAM_SPECS[selected[0]]["values"][0])
         warm.update({"sim_seconds": 0.00002, "n_cells": 2})
-        run_once(warm, 0, args.backend, simulate, args.record_every)
+        # Warm with the same coupling mode so the kNN branch is compiled out of timing.
+        run_once(warm, 0, args.backend, simulate, args.record_every,
+                 use_knn=args.knn, k=args.k)
 
     rows = []
     workers_note = (f", workers={args.workers or os.cpu_count()}"
                     if args.backend == "mp_intra" else "")
+    coupling_note = (f"knn(k={args.k})" if (args.knn and args.backend in _KNN_BACKENDS)
+                     else "all-to-all")
     print(f"Sweeping: {', '.join(selected)}  "
-          f"(backend={args.backend}, repeats={args.repeats}, seed={seed}, "
-          f"record_every={args.record_every}{workers_note})\n")
+          f"(backend={args.backend}, coupling={coupling_note}, repeats={args.repeats}, "
+          f"seed={seed}, record_every={args.record_every}{workers_note})\n")
     for param in selected:
         spec = PARAM_SPECS[param]
         for value in spec["values"]:
@@ -467,7 +515,8 @@ def main():
             # rather than aborting the whole run.
             try:
                 metrics = run_repeated(cfg, args.repeats, seed, args.backend,
-                                       simulate, args.record_every, args.workers)
+                                       simulate, args.record_every, args.workers,
+                                       args.knn, args.k)
                 row.update({k: metrics.get(k) for k in METRIC_KEYS})
                 row["status"] = "ok"
                 print(f"[{param}={value}] "
@@ -504,6 +553,8 @@ def main():
         "timestamp": stamp,
         "backend": args.backend,
         "record_every": args.record_every,
+        "knn": bool(args.knn and args.backend in _KNN_BACKENDS),
+        "k": args.k,
         "workers": (args.workers or os.cpu_count()) if args.backend == "mp_intra" else None,
         "swept_params": selected,
         "repeats": args.repeats,

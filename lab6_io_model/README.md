@@ -16,10 +16,10 @@ driver, all validated against the untouched reference.
 |------|------------|
 | `io_model.py` | **Reference** baseline (unchanged). Pure-Python scalar loops, Gauss-Seidel update order, O(N²) all-to-all gap junction. The correctness/standard reference. |
 | `io_model_vec.py` | **vec** — vectorized NumPy over all cells. Jacobi double-buffer + O(N) closed-form gap junction. |
-| `io_model_jit.py` | **jit** — scalar per-cell loops compiled with Numba `@njit`. Same Jacobi + O(N) numerics as `vec`. Fastest single-sim backend. |
+| `io_model_jit.py` | **jit** — scalar per-cell loops compiled with Numba `@njit`. Same Jacobi + O(N) numerics as `vec`. Fastest single-sim backend. Also offers optional **local (k-nearest-neighbour) gap-junction coupling** (`use_knn` + `build_neighbours`) that stays stable at large `n_cells`. |
 | `io_model_vec_jit.py` | **vec_jit** — `@njit` applied to the *vectorized* loop. Same numerics again; shows the cost of array temporaries under JIT. |
 | `validate.py` | Runs the baseline + chosen backends from one seeded state; reports speedup, divergence-vs-baseline, and machine-epsilon equality among the optimized backends. Both multiprocessing schemes (`mp`, `mp_intra`) are selectable too — a pure numeric check that they reproduce the `jit` numerics. |
-| `sweep.py` | Parameter-sweep / performance harness for **any backend** (`--backend baseline\|vec\|jit\|vec_jit\|mp_intra`): wall/CPU time, throughput, latency, real-time factor. Catches unstable configs and records them rather than aborting. |
+| `sweep.py` | Parameter-sweep / performance harness for **any backend** (`--backend baseline\|vec\|jit\|vec_jit\|mp_intra`): wall/CPU time, throughput, latency, real-time factor. Catches unstable configs and records them rather than aborting. Supports local kNN gap-junction coupling on the jit backend (`--knn`, **default on**). |
 | `profile_io.py` | `cProfile` breakdown of the baseline (per-compartment cost, gap-junction on/off, scaling with N). |
 | `mp_sims.py` | Multiprocessing across **independent** sims, using the `jit` backend as the per-sim backbone. |
 | `mp_sims_intra.py` | Multiprocessing **within one** sim: splits the cells of a single sim across processes (domain decomposition). State lives in shared memory; the only per-step IPC is the global gap-junction sum (`Sd`) all-reduce + a barrier. |
@@ -71,6 +71,10 @@ py -3 io_model_vec.py      # vectorized
 py -3 io_model_jit.py      # scalar njit (fastest)
 py -3 io_model_vec_jit.py  # njit on the vectorized loop
 ```
+
+`io_model_jit.py`'s `__main__` runs with local k-nearest-neighbour gap-junction
+coupling by default (the `USE_KNN` / `K` toggle at the top, matching `sweep.py`);
+set `USE_KNN = False` to fall back to the original all-to-all coupling.
 
 ### Validate + compare backends
 
@@ -201,14 +205,16 @@ backend, so a given `--seed` produces the same starting state whether you run
 py -3 sweep.py --list                    # show sweepable parameters
 py -3 sweep.py n_cells                    # sweep one parameter (baseline)
 py -3 sweep.py all --repeats 3            # sweep everything, best of 3
-py -3 sweep.py n_cells --backend jit      # sweep n_cells on the jit backend
+py -3 sweep.py n_cells --backend jit      # sweep n_cells on the jit backend (kNN coupling, default)
+py -3 sweep.py n_cells --backend jit --no-knn   # same sweep, original all-to-all coupling
 py -3 sweep.py all --backend vec_jit      # full sweep on vec_jit
 py -3 sweep.py n_cells --backend mp_intra --workers 4   # intra-sim parallel backend
 py -3 profile_io.py                       # cProfile breakdown of the baseline
 ```
 
 Flags: `--backend {baseline,vec,jit,vec_jit,mp_intra}` (default `baseline`),
-`--repeats`, `--seed`, `--outdir`, plus the two added this lab below. JIT backends
+`--repeats`, `--seed`, `--outdir`, plus `--knn`/`--k`, `--record-every`, and
+`--workers` documented below. JIT backends
 are warmed up (compiled) once before timing so compilation is not charged to the
 first run. Results are written to
 `sweep_results/sweep_<backend>_<params>_<stamp>.{csv,json}`.
@@ -237,16 +243,40 @@ py -3 sweep.py n_cells --backend jit --record-every 40   # bounded trace
 py -3 sweep.py n_cells --backend jit --record-every 0    # no recording
 ```
 
-**Unstable configs are caught, not fatal.** The explicit-Euler model goes stiff
-at large `n_cells` *with gap junctions on* — the O(N) gap current
-`C_gap·(N·Vd − ΣVd)` grows with population, voltages blow up, and a gating
-denominator hits zero (a `ZeroDivisionError` under Numba). The sweep records that
-point with `status = "unstable: <Error>"` in the CSV/table and **continues** to
-the next value instead of aborting. (With `enable_gapjunctions` off the same large
-populations run fine.) For `--backend mp_intra` the same blow-up happens inside a
-worker process; it is surfaced as an `ArithmeticError` to the parent (workers
-flag it and `abort()` the barrier so nothing hangs), which the sweep catches the
-same way. The default sweep `n_cells` range (≤ 30) never reaches it.
+**`--knn` / `--no-knn` (default `--knn`) and `--k K` (default 8) — jit only.**
+Local gap-junction coupling: each cell couples only to its `K` nearest neighbours
+instead of every other cell. Because the coupling degree is fixed at `K`
+regardless of population, the per-step dendritic update no longer grows with
+`n_cells`, so large populations stay numerically stable (and the topology is also
+more biologically faithful — real olivary gap junctions are local, not all-to-all).
+The neighbour list is built once per config with `io_model_jit.build_neighbours`
+(random positions + KD-tree) **outside** the timed region, then a per-timestep
+neighbour-sum keeps the gap term O(1) per cell — the same precompute-the-sum trick
+as the all-to-all path, restricted to a fixed neighbour set. `--no-knn` restores
+the original all-to-all coupling. Only the `jit` backend implements this; on any
+other backend the flag is ignored (a one-line note is printed) and coupling stays
+all-to-all.
+
+```bash
+py -3 sweep.py n_cells --backend jit            # kNN (default): stable past 1000 cells
+py -3 sweep.py n_cells --backend jit --k 16     # denser local coupling
+py -3 sweep.py n_cells --backend jit --no-knn   # all-to-all: goes unstable above ~4000 cells
+```
+
+**Unstable configs are caught, not fatal.** With all-to-all coupling (`--no-knn`,
+or any non-jit backend) the explicit-Euler model goes stiff at large `n_cells`
+*with gap junctions on* — the O(N) gap current `C_gap·(N·Vd − ΣVd)` grows with
+population, voltages blow up, and a gating denominator hits zero (a
+`ZeroDivisionError` under Numba) near ~4000 cells. The sweep records that point
+with `status = "unstable: <Error>"` in the CSV/table and **continues** to the next
+value instead of aborting. (With `enable_gapjunctions` off, or under the default
+`--knn` coupling, the same large populations run fine.) For `--backend mp_intra`
+the same blow-up happens inside a worker process; it is surfaced as an
+`ArithmeticError` to the parent (workers flag it and `abort()` the barrier so
+nothing hangs), which the sweep catches the same way. The `n_cells` sweep range
+goes up to 5000 specifically to exercise this threshold: under the default kNN
+coupling every value is stable, while `--no-knn` flags the 5000-cell point
+(and on the jit backend nothing else) as unstable.
 
 ---
 

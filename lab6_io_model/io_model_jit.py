@@ -44,6 +44,55 @@ V_l     = 10.0
 C_gap   = 0.05
 
 
+# Sentinel passed to the njit core when gap junctions are all-to-all (use_knn
+# False). The core never indexes it in that path, so an empty (0,0) int array is
+# enough to give Numba a concrete int64[:, :] type to compile against.
+_NO_NEIGHBOURS = np.empty((0, 0), dtype=np.int64)
+
+
+def build_neighbours(n_cells, k=8, seed=1981, dims=3):
+    """Precompute each cell's k nearest neighbours for *local* gap-junction
+    coupling (replaces the all-to-all sum, which both blows up numerically and
+    grows O(N) as the population scales -- see the dend gap term below).
+
+    The model has no geometry, so we first scatter the cells at random positions
+    in a unit `dims`-cube, then keep the k closest others by Euclidean distance.
+    A fixed k means each cell's coupling degree is independent of n_cells, which
+    is what removes the explicit-Euler instability AND matches the biology (real
+    olivary gap junctions connect a handful of touching dendrites, not the whole
+    network).
+
+    Returns an int64 array of shape (n_cells, k_eff) where k_eff = min(k,
+    n_cells-1); row i holds the indices of cell i's neighbours. Note the relation
+    can be asymmetric (i in nbrs[j] does not imply j in nbrs[i]); symmetrise the
+    adjacency if you need strictly bidirectional junctions.
+    """
+    k_eff = min(k, n_cells - 1)
+    rng = np.random.default_rng(seed)
+    pos = rng.uniform(0.0, 1.0, size=(n_cells, dims))
+    neighbours = np.empty((n_cells, k_eff), dtype=np.int64)
+
+    try:
+        # O(N log N) via a KD-tree when SciPy is available.
+        from scipy.spatial import cKDTree
+        tree = cKDTree(pos)
+        _dist, idx = tree.query(pos, k=k_eff + 1)  # +1: nearest point is self
+        idx = np.atleast_2d(idx)
+        for i in range(n_cells):
+            row = idx[i]
+            neighbours[i] = row[row != i][:k_eff]
+    except ImportError:
+        # NumPy fallback: per-cell argpartition. O(N^2) time but O(N) memory
+        # (no full pairwise matrix), so it still runs at large N, just slower.
+        for i in range(n_cells):
+            d2 = np.sum((pos - pos[i]) ** 2, axis=1)
+            d2[i] = np.inf  # exclude self
+            nn = np.argpartition(d2, k_eff)[:k_eff]
+            neighbours[i] = nn
+
+    return neighbours
+
+
 @njit(cache=True)
 def simulate(
     V_soma, V_axon, V_dend,
@@ -52,6 +101,7 @@ def simulate(
     dend_Ca2Plus, dend_Calcium_r, dend_Potassium_s, dend_Hcurrent_q,
     g_CaL, n_cells, n_simsteps, delta, sim_seconds,
     enable_gapjunctions, I_app, I_pulse10ms, record, record_every=1,
+    use_knn=False, neighbours=_NO_NEIGHBOURS,
 ):
     """Scalar-njit Jacobi backend (same numerics as io_model_vec.simulate).
 
@@ -60,6 +110,16 @@ def simulate(
     empty array. record_every logs a row only every Nth step (state still
     advances every step), so n_rec = ceil(n_simsteps / record_every); this keeps
     the buffer bounded at large n_cells. record_every=1 is the original trace.
+
+    Gap junctions: with use_knn False the coupling is all-to-all via the O(N)
+    closed form C_gap*(N*vd - Sd). With use_knn True each cell couples only to its
+    `neighbours` rows; we precompute a per-cell neighbour-sum once per timestep
+    (one O(N*k) pass) so the per-cell gap term is still O(1) at point of use --
+    the same precompute-the-sum idea as the all-to-all Sd, restricted to a fixed
+    neighbour set. The local args default to use_knn=False / the empty
+    _NO_NEIGHBOURS sentinel, so existing callers that pass everything up to
+    record_every positionally reproduce the original all-to-all numerics exactly;
+    pass use_knn=True with a build_neighbours(...) array to enable local coupling.
     """
     # Copy so the caller's seeded state is not mutated (validate reuses it).
     V_soma = V_soma.copy(); V_axon = V_axon.copy(); V_dend = V_dend.copy()
@@ -76,6 +136,11 @@ def simulate(
         v_trace = np.empty((0, 0, 0))
     t = 0.0
 
+    # Per-cell neighbour-sum buffer for the local (kNN) gap path. Allocated once
+    # and refilled each timestep; unused (but kept typed) in the all-to-all path.
+    nbr_sum = np.zeros(n_cells)
+    k_deg = neighbours.shape[1]  # fixed coupling degree per cell (kNN path)
+
     for i_epoch in range(n_simsteps):
         # --- start-of-step snapshot: all d*/dt this step read ONLY these (Jacobi).
         Vs = V_soma.copy()
@@ -86,11 +151,22 @@ def simulate(
         do_record = record and (i_epoch % record_every == 0)
         rec = i_epoch // record_every
 
-        # O(N) gap: precompute sum(Vd) once; I_gap[i] = C_gap*(N*Vd[i] - Sd).
+        # Precompute the gap-coupling sum(s) once per step so the per-cell gap
+        # term below is O(1). All-to-all: a single scalar Sd = sum(Vd), then
+        # I_gap[i] = C_gap*(N*Vd[i] - Sd). Local (kNN): a per-cell neighbour-sum
+        # nbr_sum[i] = sum over i's k neighbours, then I_gap[i] =
+        # C_gap*(k*Vd[i] - nbr_sum[i]) -- same idea, fixed neighbour set.
         Sd = 0.0
         if enable_gapjunctions:
-            for j in range(n_cells):
-                Sd += Vd[j]
+            if use_knn:
+                for i in range(n_cells):
+                    s = 0.0
+                    for jj in range(k_deg):
+                        s += Vd[neighbours[i, jj]]
+                    nbr_sum[i] = s
+            else:
+                for j in range(n_cells):
+                    Sd += Vd[j]
 
         # Current pulse window is a scalar per step (broadcast to all cells).
         pulse = -I_pulse10ms if (200 * sim_seconds < t and t < 210 * sim_seconds) else 0.0
@@ -156,7 +232,10 @@ def simulate(
             dend_Ikca = g_K_Ca * dend_Potassium_s[i] * (vd - V_K)
             dend_Ih = g_h * dend_Hcurrent_q[i] * (vd - V_h)
             if enable_gapjunctions:
-                dend_I_gap = C_gap * (n_cells * vd - Sd)  # O(N) closed form
+                if use_knn:
+                    dend_I_gap = C_gap * (k_deg * vd - nbr_sum[i])  # local, O(1)
+                else:
+                    dend_I_gap = C_gap * (n_cells * vd - Sd)  # all-to-all, O(1)
             else:
                 dend_I_gap = 0.0
 
@@ -203,6 +282,13 @@ if __name__ == "__main__":
     I_pulse10ms = 2.0
     np.random.seed(1981)
 
+    # Local gap-junction coupling (default, matching sweep.py): each cell couples
+    # to only its K nearest neighbours, which stays stable at large n_cells. Set
+    # USE_KNN=False to fall back to the original all-to-all coupling.
+    USE_KNN = True
+    K = 8
+    neighbours = build_neighbours(n_cells, k=K, seed=1981) if USE_KNN else _NO_NEIGHBOURS
+
     g_CaL = np.random.normal(0.7, 0.1, n_cells)
     V_soma = np.random.uniform(-70, -40, size=(n_cells,))
     soma_k = np.full(n_cells, 0.7423159)
@@ -225,13 +311,15 @@ if __name__ == "__main__":
 
     # Warm-up on a tiny problem (n_simsteps=2) to move JIT compilation OUT of the
     # timed region; cache=True amortizes it across future runs (lab1 convention).
-    simulate(*args, 2, delta, sim_seconds, enable_gapjunctions, I_app, I_pulse10ms, False)
+    simulate(*args, 2, delta, sim_seconds, enable_gapjunctions, I_app, I_pulse10ms,
+             False, use_knn=USE_KNN, neighbours=neighbours)
 
     n_simsteps = int(sim_seconds * 1000 / delta + 0.5)
 
     tic = time.process_time()
     v_trace, _ = simulate(*args, n_simsteps, delta, sim_seconds,
-                          enable_gapjunctions, I_app, I_pulse10ms, True)
+                          enable_gapjunctions, I_app, I_pulse10ms, True,
+                          use_knn=USE_KNN, neighbours=neighbours)
     print(f"Simulation execution time: {time.process_time() - tic :.3f} sec.")
 
     for i in range(n_cells):
