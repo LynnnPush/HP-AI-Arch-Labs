@@ -27,6 +27,9 @@
 #   # repeat every run 3x and keep the best (lowest) wall time
 #   python3 sweep.py n_cells --repeats 3
 #
+#   # sweep on a different io_model backend (default: baseline)
+#   python3 sweep.py n_cells --backend vec_jit
+#
 
 import argparse
 import csv
@@ -42,6 +45,32 @@ import numpy as np
 # Import the model under test. Importing only defines the functions / default
 # globals; the simulation in its __main__ block does NOT run on import.
 import io_model
+
+
+# ---------------------------------------------------------------------------
+# Selectable io_model backends. "baseline" is the untouched Gauss-Seidel
+# reference (per-cell update_* helpers); the rest expose a vectorized/compiled
+# simulate(...) with the common signature used in validate.py. The compiled
+# (njit) ones are warmed up once before timing so JIT compilation is excluded.
+# Optimized modules are imported lazily so a baseline-only run does not require
+# numba to be installed.
+# ---------------------------------------------------------------------------
+BACKENDS = ("baseline", "vec", "jit", "vec_jit")
+_JIT_BACKENDS = {"jit", "vec_jit"}
+_BACKEND_MODULES = {
+    "vec": "io_model_vec",
+    "jit": "io_model_jit",
+    "vec_jit": "io_model_vec_jit",
+}
+
+
+def resolve_backend(backend):
+    """Return the simulate(...) callable for an optimized backend, or None for
+    the baseline (which is driven by io_model's per-cell update_* helpers)."""
+    if backend == "baseline":
+        return None
+    import importlib
+    return importlib.import_module(_BACKEND_MODULES[backend]).simulate
 
 
 # ---------------------------------------------------------------------------
@@ -76,7 +105,7 @@ PARAM_SPECS = {
         "help": "Time-step duration in seconds.",
     },
     "n_cells": {
-        "values": [1, 2, 10, 30],
+        "values": [1, 2, 10, 30, 100, 1000, 10000, 100000],
         "overrides": {},
         "help": "Cell population size.",
     },
@@ -137,27 +166,17 @@ def build_initial_state(n_cells, g_CaL, seed):
     return state
 
 
-def run_once(cfg, seed):
-    """Run a single simulation with the given config dict and return metrics.
-
-    The model's update functions read several module-level globals, so we push
-    the config into the io_model namespace before running.
-    """
-    sim_seconds = cfg["sim_seconds"]
-    delta = cfg["delta"]
-    n_cells = cfg["n_cells"]
-
+def _step_baseline(cfg, st, n_cells, n_simsteps, delta):
+    """Drive the reference Gauss-Seidel loop (per-cell update_* helpers) and
+    return (wall_time, cpu_time). The helpers read io_model module globals."""
     # Push parameters into the model's global namespace (the update_* functions
     # read these directly).
-    io_model.sim_seconds = sim_seconds
+    io_model.sim_seconds = cfg["sim_seconds"]
     io_model.delta = delta
     io_model.n_cells = n_cells
     io_model.enable_gapjunctions = cfg["enable_gapjunctions"]
     io_model.I_pulse10ms = cfg["I_pulse10ms"]
 
-    st = build_initial_state(n_cells, cfg["g_CaL"], seed)
-
-    n_simsteps = int(sim_seconds * 1000 / delta + 0.5)
     v_trace = [np.empty((n_simsteps, 4)) for _ in range(n_cells)]
     t = 0.0
 
@@ -185,8 +204,52 @@ def run_once(cfg, seed):
             v_trace[i_cell][i_epoch, -1] = t
         t += delta
 
-    wall_time = time.perf_counter() - wall_tic
-    cpu_time = time.process_time() - cpu_tic
+    return time.perf_counter() - wall_tic, time.process_time() - cpu_tic
+
+
+def _step_optimized(simulate, cfg, st, n_cells, n_simsteps, delta):
+    """Drive an optimized backend's simulate(...) once and return
+    (wall_time, cpu_time). All four optimized signatures share the positional
+    order (enable_gapjunctions, I_app, I_pulse10ms, record).
+
+    record=False: the sweep only measures timing and never reads the trace, so
+    we skip the (n_simsteps, n_cells, 4) buffer -- at large n_cells that array
+    is what blows up (e.g. 100k steps x 10k cells x 4 x 8 B ~= 32 GB)."""
+    wall_tic = time.perf_counter()
+    cpu_tic = time.process_time()
+
+    simulate(
+        st["V_soma"], st["V_axon"], st["V_dend"],
+        st["soma_k"], st["soma_l"], st["soma_h"], st["soma_n"], st["soma_x"],
+        st["axon_Sodium_h"], st["axon_Potassium_x"],
+        st["dend_Ca2Plus"], st["dend_Calcium_r"], st["dend_Potassium_s"], st["dend_Hcurrent_q"],
+        st["g_CaL"], n_cells, n_simsteps, delta, cfg["sim_seconds"],
+        cfg["enable_gapjunctions"], 0.0, cfg["I_pulse10ms"], False,
+    )
+
+    return time.perf_counter() - wall_tic, time.process_time() - cpu_tic
+
+
+def run_once(cfg, seed, backend="baseline", simulate=None):
+    """Run a single simulation with the given config dict and return metrics.
+
+    `backend` selects the io_model implementation ("baseline" or one of the
+    optimized backends in BACKENDS); `simulate` is the pre-resolved callable for
+    an optimized backend (see resolve_backend) and is ignored for the baseline.
+    The seeded initial state is built (and excluded from timing) the same way
+    for every backend so results are apples-to-apples.
+    """
+    sim_seconds = cfg["sim_seconds"]
+    delta = cfg["delta"]
+    n_cells = cfg["n_cells"]
+
+    st = build_initial_state(n_cells, cfg["g_CaL"], seed)
+    n_simsteps = int(sim_seconds * 1000 / delta + 0.5)
+
+    if backend == "baseline":
+        wall_time, cpu_time = _step_baseline(cfg, st, n_cells, n_simsteps, delta)
+    else:
+        wall_time, cpu_time = _step_optimized(simulate, cfg, st, n_cells, n_simsteps, delta)
 
     total_cell_steps = n_simsteps * n_cells
 
@@ -208,12 +271,12 @@ def run_once(cfg, seed):
     return metrics
 
 
-def run_repeated(cfg, repeats, seed):
+def run_repeated(cfg, repeats, seed, backend="baseline", simulate=None):
     """Run a config `repeats` times; keep the fastest (lowest wall time) run."""
     best = None
     all_wall = []
     for _ in range(repeats):
-        m = run_once(cfg, seed)
+        m = run_once(cfg, seed, backend, simulate)
         all_wall.append(m["wall_time_s"])
         if best is None or m["wall_time_s"] < best["wall_time_s"]:
             best = m
@@ -245,7 +308,7 @@ def print_table(rows):
     """Pretty-print a compact summary table to stdout."""
     cols = ["swept_param", "swept_value", "n_cells", "delta", "sim_seconds",
             "wall_time_s", "throughput_cellsteps_per_s", "latency_us_per_step",
-            "realtime_factor"]
+            "realtime_factor", "status"]
     widths = {c: len(c) for c in cols}
     fmt_rows = []
     for r in rows:
@@ -277,6 +340,9 @@ def main():
     )
     parser.add_argument("--list", action="store_true",
                         help="List sweepable parameters and their ranges, then exit.")
+    parser.add_argument("--backend", choices=BACKENDS, default="baseline",
+                        help="Which io_model implementation to sweep: " + ", ".join(BACKENDS)
+                             + " (default: baseline).")
     parser.add_argument("--repeats", type=int, default=1,
                         help="Repeat each run N times; keep the fastest (default: 1).")
     parser.add_argument("--seed", type=int, default=1981,
@@ -312,24 +378,47 @@ def main():
 
     seed = None if args.seed == -1 else args.seed
 
+    # Resolve the chosen backend's simulate(...) once (lazy import). For the
+    # njit-compiled backends, do a tiny throwaway run first so JIT compilation
+    # is not charged to the first swept config's timing.
+    simulate = resolve_backend(args.backend)
+    if args.backend in _JIT_BACKENDS:
+        print(f"Warming up '{args.backend}' (JIT compilation)...")
+        warm = make_config(selected[0], PARAM_SPECS[selected[0]]["values"][0])
+        warm.update({"sim_seconds": 0.00002, "n_cells": 2})
+        run_once(warm, 0, args.backend, simulate)
+
     rows = []
-    print(f"Sweeping: {', '.join(selected)}  (repeats={args.repeats}, seed={seed})\n")
+    print(f"Sweeping: {', '.join(selected)}  "
+          f"(backend={args.backend}, repeats={args.repeats}, seed={seed})\n")
     for param in selected:
         spec = PARAM_SPECS[param]
         for value in spec["values"]:
             cfg = make_config(param, value)
-            metrics = run_repeated(cfg, args.repeats, seed)
 
             row = {"swept_param": param, "swept_value": value}
             row.update({k: cfg[k] for k in CONFIG_KEYS})
-            row.update({k: metrics.get(k) for k in METRIC_KEYS})
-            rows.append(row)
 
-            print(f"[{param}={value}] "
-                  f"wall={metrics['wall_time_s']:.3f}s  "
-                  f"throughput={metrics['throughput_cellsteps_per_s']:.3g} cell-steps/s  "
-                  f"latency={metrics['latency_us_per_step']:.4g} us/step  "
-                  f"rt_factor={metrics['realtime_factor']:.3g}x")
+            # A config can blow up (e.g. the explicit-Euler IO model goes stiff
+            # at large n_cells with gap junctions on -> non-finite V -> a gating
+            # denominator hits zero). Record it as 'unstable' and keep sweeping
+            # rather than aborting the whole run.
+            try:
+                metrics = run_repeated(cfg, args.repeats, seed, args.backend, simulate)
+                row.update({k: metrics.get(k) for k in METRIC_KEYS})
+                row["status"] = "ok"
+                print(f"[{param}={value}] "
+                      f"wall={metrics['wall_time_s']:.3f}s  "
+                      f"throughput={metrics['throughput_cellsteps_per_s']:.3g} cell-steps/s  "
+                      f"latency={metrics['latency_us_per_step']:.4g} us/step  "
+                      f"rt_factor={metrics['realtime_factor']:.3g}x")
+            except (ArithmeticError, FloatingPointError) as e:
+                row.update({k: None for k in METRIC_KEYS})
+                row["status"] = f"unstable: {type(e).__name__}"
+                print(f"[{param}={value}] UNSTABLE -- {type(e).__name__}: {e} "
+                      f"(skipped, sweep continues)")
+
+            rows.append(row)
 
     print()
     print_table(rows)
@@ -338,9 +427,9 @@ def main():
     os.makedirs(args.outdir, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     tag = "all" if set(selected) == set(PARAM_SPECS) else "_".join(selected)
-    base = os.path.join(args.outdir, f"sweep_{tag}_{stamp}")
+    base = os.path.join(args.outdir, f"sweep_{args.backend}_{tag}_{stamp}")
 
-    fieldnames = ["swept_param", "swept_value"] + CONFIG_KEYS + METRIC_KEYS
+    fieldnames = ["swept_param", "swept_value"] + CONFIG_KEYS + METRIC_KEYS + ["status"]
     csv_path = base + ".csv"
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -350,6 +439,7 @@ def main():
 
     meta = {
         "timestamp": stamp,
+        "backend": args.backend,
         "swept_params": selected,
         "repeats": args.repeats,
         "seed": seed,
