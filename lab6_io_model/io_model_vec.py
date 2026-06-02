@@ -58,13 +58,19 @@ def simulate(
     g_CaL,
     n_cells, n_simsteps, delta, sim_seconds,
     enable_gapjunctions=True, I_app=0.0, I_pulse10ms=2.0,
-    record=True,
+    record=True, record_every=1,
 ):
     """Vectorized Jacobi IO simulation over all cells at once.
 
     All state args are (n_cells,) float64 arrays (see sweep.build_initial_state).
-    Returns (v_trace, n_simsteps) where v_trace is a (n_simsteps, n_cells, 4)
-    array (columns: V_soma, V_axon, V_dend, t) when record=True, else None.
+    Returns (v_trace, n_simsteps) where v_trace is a (n_rec, n_cells, 4) array
+    (columns: V_soma, V_axon, V_dend, t) when record=True, else None.
+
+    record_every decouples trace sampling from the (dense) integration step: the
+    state still advances every step, but a row is logged only every Nth step, so
+    n_rec = ceil(n_simsteps / record_every). This bounds the trace buffer at
+    large n_cells (the dense buffer is what OOMs) while keeping the numerics
+    identical. record_every=1 reproduces the original step-by-step trace.
     """
     # Work on copies so the caller's initial-state arrays are not mutated
     # (validate.py reuses the same seeded state across backends).
@@ -84,8 +90,9 @@ def simulate(
     dend_Hcurrent_q = dend_Hcurrent_q.astype(np.float64).copy()
     g_CaL = g_CaL.astype(np.float64)
 
-    # (n_simsteps, n_cells, 4) trace: one slice-assignment per step.
-    v_trace = np.empty((n_simsteps, n_cells, 4)) if record else None
+    # (n_rec, n_cells, 4) trace: one slice-assignment every record_every steps.
+    n_rec = (n_simsteps + record_every - 1) // record_every if record else 0
+    v_trace = np.empty((n_rec, n_cells, 4)) if record else None
     t = 0.0
 
     for i_epoch in range(n_simsteps):
@@ -94,12 +101,14 @@ def simulate(
         Vs, Va, Vd = V_soma, V_axon, V_dend
 
         # Record the start-of-step potentials (matches the reference, which logs
-        # each compartment's V before writing it).
-        if record:
-            v_trace[i_epoch, :, 0] = Vs
-            v_trace[i_epoch, :, 1] = Va
-            v_trace[i_epoch, :, 2] = Vd
-            v_trace[i_epoch, :, 3] = t
+        # each compartment's V before writing it) -- but only every record_every
+        # steps, so the trace buffer stays bounded.
+        if record and i_epoch % record_every == 0:
+            rec = i_epoch // record_every
+            v_trace[rec, :, 0] = Vs
+            v_trace[rec, :, 1] = Va
+            v_trace[rec, :, 2] = Vd
+            v_trace[rec, :, 3] = t
 
         # ================= SOMA (reads Vs, Va, Vd) =================
         soma_I_leak = g_ls * (Vs - V_l)

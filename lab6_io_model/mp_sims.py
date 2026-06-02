@@ -22,12 +22,18 @@ from sweep import build_initial_state
 SPIKE_THRESHOLD = -20.0  # mV; soma upward crossings counted as spikes
 
 
-def run_simulation(seed, n_cells, sim_seconds, delta, enable_gj=True, I_pulse10ms=2.0):
+def run_simulation(seed, n_cells, sim_seconds, delta, enable_gj=True,
+                   I_pulse10ms=2.0, return_trace=False):
     """Run one independent sim and return its total soma spike count.
 
     Builds an independent initial state from `seed`, runs the jit backbone, and
     reduces the trace to a single number so workers return almost nothing (no
     big traces to pickle back to the parent).
+
+    With `return_trace=True` it returns the full (n_simsteps, n_cells, 4) voltage
+    trace instead -- used by validate.py to confirm the cross-sim pipeline
+    reproduces the jit numerics end-to-end (one sim shipped through a worker and
+    its trace pickled back). Not used on the throughput path.
     """
     st = build_initial_state(n_cells, None, seed)
     n_simsteps = int(sim_seconds * 1000 / delta + 0.5)
@@ -39,6 +45,8 @@ def run_simulation(seed, n_cells, sim_seconds, delta, enable_gj=True, I_pulse10m
         st["g_CaL"], n_cells, n_simsteps, delta, sim_seconds,
         enable_gj, 0.0, I_pulse10ms, True,
     )
+    if return_trace:
+        return v_trace
     soma = v_trace[:, :, 0]
     return int(((soma[:-1] < SPIKE_THRESHOLD) & (soma[1:] >= SPIKE_THRESHOLD)).sum())
 

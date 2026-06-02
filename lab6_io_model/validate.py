@@ -22,6 +22,8 @@ import io_model
 import io_model_vec
 import io_model_vec_jit
 import io_model_jit
+import mp_sims
+import mp_sims_intra
 from sweep import build_initial_state
 
 
@@ -142,12 +144,59 @@ def run_vec_jit_trace(n_cells=30, sim_seconds=1.0, delta=0.01,
     )
 
 
+def run_mp_trace(n_cells=30, sim_seconds=1.0, delta=0.01,
+                 enable_gapjunctions=True, I_app=0.0, I_pulse10ms=2.0,
+                 g_CaL=None, seed=1981, record=True):
+    """Run ONE sim through mp_sims' cross-sim machinery (a ProcessPoolExecutor
+    worker) and return its trace, in the (n_simsteps, n_cells, 4) layout.
+
+    This validates the across-sims pipeline end-to-end: the sim runs in a child
+    process and its trace is pickled back. One worker is enough -- validation
+    needs only the single seed-matched trace to compare, not mp_sims' across-sims
+    throughput. The per-sim backbone is io_model_jit, so it should match the
+    `jit` backend exactly. g_CaL is ignored (mp_sims randomizes per cell from the
+    seed, as the baseline does at g_CaL=None)."""
+    from concurrent.futures import ProcessPoolExecutor
+    n_simsteps = int(sim_seconds * 1000 / delta + 0.5)
+    with ProcessPoolExecutor(max_workers=1) as ex:
+        v_trace = ex.submit(
+            mp_sims.run_simulation, seed, n_cells, sim_seconds, delta,
+            enable_gapjunctions, I_pulse10ms, True).result()  # return_trace=True
+    return v_trace, n_simsteps
+
+
+def run_mp_intra_trace(n_cells=30, sim_seconds=1.0, delta=0.01,
+                       enable_gapjunctions=True, I_app=0.0, I_pulse10ms=2.0,
+                       g_CaL=None, seed=1981, record=True):
+    """Run the intra-sim parallel backend (one sim's cells split across
+    processes) and return its dense trace, in the (n_simsteps, n_cells, 4)
+    layout.
+
+    This validates the WITHIN-sim parallel decomposition: the shared-memory
+    state + per-step Sd all-reduce must reproduce the same numerics. The global
+    Sd is summed as (sum of per-worker partial sums) rather than one sequential
+    pass, so it agrees with `jit` to ~machine epsilon, not bit-for-bit (the
+    equality cross-check measures this in the clean early window)."""
+    _, _, _, _, v_trace = mp_sims_intra.simulate_intra(
+        n_cells, sim_seconds, delta, enable_gj=enable_gapjunctions,
+        I_pulse10ms=I_pulse10ms, seed=seed, g_CaL=g_CaL,
+        record=record, record_every=1)
+    n_simsteps = int(sim_seconds * 1000 / delta + 0.5)
+    return v_trace, n_simsteps
+
+
 # Registry of optimized backends selectable on the command line. Order here is
-# the canonical print order. _NEEDS_WARMUP marks the njit-compiled ones.
+# the canonical print order. _NEEDS_WARMUP marks the njit-compiled ones. The two
+# `mp*` entries are the multiprocessing schemes (across-sims and within-sim);
+# they self-warm their own JIT kernels, so they are not in _NEEDS_WARMUP. This
+# is purely a NUMERIC check -- for a fair speed comparison of the two schemes
+# (throughput vs latency) see mp_bench.py.
 BACKENDS = {
     "vec": run_vec_trace,
     "vec_jit": run_vec_jit_trace,
     "jit": run_jit_trace,
+    "mp": run_mp_trace,
+    "mp_intra": run_mp_intra_trace,
 }
 _NEEDS_WARMUP = {"vec_jit", "jit"}
 

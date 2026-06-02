@@ -55,8 +55,12 @@ import io_model
 # Optimized modules are imported lazily so a baseline-only run does not require
 # numba to be installed.
 # ---------------------------------------------------------------------------
-BACKENDS = ("baseline", "vec", "jit", "vec_jit")
+BACKENDS = ("baseline", "vec", "jit", "vec_jit", "mp_intra")
 _JIT_BACKENDS = {"jit", "vec_jit"}
+# mp_intra is special: it is NOT a module.simulate(...) backend. It splits one
+# sim's cells across processes, building its OWN shared-memory state and spawning
+# workers, so it has no entry here and is driven by _step_intra (not
+# _step_optimized). It self-warms its njit kernels, so it is not in _JIT_BACKENDS.
 _BACKEND_MODULES = {
     "vec": "io_model_vec",
     "jit": "io_model_jit",
@@ -66,8 +70,9 @@ _BACKEND_MODULES = {
 
 def resolve_backend(backend):
     """Return the simulate(...) callable for an optimized backend, or None for
-    the baseline (which is driven by io_model's per-cell update_* helpers)."""
-    if backend == "baseline":
+    the baseline / mp_intra (driven by their own step functions, not a shared
+    module.simulate signature)."""
+    if backend in ("baseline", "mp_intra"):
         return None
     import importlib
     return importlib.import_module(_BACKEND_MODULES[backend]).simulate
@@ -105,7 +110,7 @@ PARAM_SPECS = {
         "help": "Time-step duration in seconds.",
     },
     "n_cells": {
-        "values": [1, 2, 10, 30, 100, 1000, 10000, 100000],
+        "values": [1, 2, 10, 30, 100, 1000],
         "overrides": {},
         "help": "Cell population size.",
     },
@@ -207,14 +212,19 @@ def _step_baseline(cfg, st, n_cells, n_simsteps, delta):
     return time.perf_counter() - wall_tic, time.process_time() - cpu_tic
 
 
-def _step_optimized(simulate, cfg, st, n_cells, n_simsteps, delta):
+def _step_optimized(simulate, cfg, st, n_cells, n_simsteps, delta, record_every):
     """Drive an optimized backend's simulate(...) once and return
     (wall_time, cpu_time). All four optimized signatures share the positional
-    order (enable_gapjunctions, I_app, I_pulse10ms, record).
+    order (enable_gapjunctions, I_app, I_pulse10ms, record, record_every).
 
-    record=False: the sweep only measures timing and never reads the trace, so
-    we skip the (n_simsteps, n_cells, 4) buffer -- at large n_cells that array
-    is what blows up (e.g. 100k steps x 10k cells x 4 x 8 B ~= 32 GB)."""
+    Recording mirrors the baseline (allocate + fill the trace inside the timed
+    region, then discard it), but only every `record_every` steps so the buffer
+    stays bounded -- the dense (n_simsteps, n_cells, 4) trace is what blows up at
+    large n_cells (e.g. 100k steps x 10k cells x 4 x 8 B ~= 32 GB). record_every
+    <= 0 disables recording entirely for the very largest runs."""
+    record = record_every > 0
+    stride = record_every if record else 1
+
     wall_tic = time.perf_counter()
     cpu_tic = time.process_time()
 
@@ -224,32 +234,69 @@ def _step_optimized(simulate, cfg, st, n_cells, n_simsteps, delta):
         st["axon_Sodium_h"], st["axon_Potassium_x"],
         st["dend_Ca2Plus"], st["dend_Calcium_r"], st["dend_Potassium_s"], st["dend_Hcurrent_q"],
         st["g_CaL"], n_cells, n_simsteps, delta, cfg["sim_seconds"],
-        cfg["enable_gapjunctions"], 0.0, cfg["I_pulse10ms"], False,
+        cfg["enable_gapjunctions"], 0.0, cfg["I_pulse10ms"], record, stride,
     )
 
     return time.perf_counter() - wall_tic, time.process_time() - cpu_tic
 
 
-def run_once(cfg, seed, backend="baseline", simulate=None):
+def _step_intra(cfg, n_cells, delta, record_every, workers, seed):
+    """Drive the intra-sim parallel backend (mp_sims_intra) once and return
+    (wall_time, cpu_time).
+
+    Unlike the other backends, this one builds its OWN shared-memory state from
+    the seed (so workers can attach to it) and spawns processes. `wall_time` is
+    the spawn+join window measured inside simulate_intra (state build + JIT warm
+    excluded); `cpu_time` aggregates the worker processes' CPU via os.times()
+    children counters (parent-only process_time would miss the forked workers).
+    `record_every` follows the same convention as the other backends (stride for
+    the bounded trace; <=0 disables recording). Imported lazily so a baseline
+    sweep still needs no numba."""
+    from mp_sims_intra import simulate_intra
+
+    record = record_every > 0
+    stride = record_every if record else 1
+
+    c0 = os.times()
+    elapsed, _throughput, _spikes, _n_workers, _trace = simulate_intra(
+        n_cells, cfg["sim_seconds"], delta,
+        enable_gj=cfg["enable_gapjunctions"], I_pulse10ms=cfg["I_pulse10ms"],
+        seed=seed, n_workers=workers, g_CaL=cfg["g_CaL"],
+        record=record, record_every=stride,
+    )
+    c1 = os.times()
+    cpu_time = ((c1.children_user + c1.children_system)
+                - (c0.children_user + c0.children_system))
+    return elapsed, cpu_time
+
+
+def run_once(cfg, seed, backend="baseline", simulate=None, record_every=40,
+             workers=None):
     """Run a single simulation with the given config dict and return metrics.
 
     `backend` selects the io_model implementation ("baseline" or one of the
     optimized backends in BACKENDS); `simulate` is the pre-resolved callable for
     an optimized backend (see resolve_backend) and is ignored for the baseline.
-    The seeded initial state is built (and excluded from timing) the same way
-    for every backend so results are apples-to-apples.
+    `record_every` is the optimized-backend trace stride (<=0 disables recording;
+    the baseline always records densely, as in the reference). `workers` is the
+    process count for the mp_intra backend (ignored otherwise). The seeded initial
+    state is built (and excluded from timing) the same way for every backend so
+    results are apples-to-apples.
     """
     sim_seconds = cfg["sim_seconds"]
     delta = cfg["delta"]
     n_cells = cfg["n_cells"]
-
-    st = build_initial_state(n_cells, cfg["g_CaL"], seed)
     n_simsteps = int(sim_seconds * 1000 / delta + 0.5)
 
-    if backend == "baseline":
-        wall_time, cpu_time = _step_baseline(cfg, st, n_cells, n_simsteps, delta)
+    if backend == "mp_intra":
+        # Builds its own shared-memory state from the seed -> no pre-built st here.
+        wall_time, cpu_time = _step_intra(cfg, n_cells, delta, record_every, workers, seed)
     else:
-        wall_time, cpu_time = _step_optimized(simulate, cfg, st, n_cells, n_simsteps, delta)
+        st = build_initial_state(n_cells, cfg["g_CaL"], seed)
+        if backend == "baseline":
+            wall_time, cpu_time = _step_baseline(cfg, st, n_cells, n_simsteps, delta)
+        else:
+            wall_time, cpu_time = _step_optimized(simulate, cfg, st, n_cells, n_simsteps, delta, record_every)
 
     total_cell_steps = n_simsteps * n_cells
 
@@ -271,12 +318,13 @@ def run_once(cfg, seed, backend="baseline", simulate=None):
     return metrics
 
 
-def run_repeated(cfg, repeats, seed, backend="baseline", simulate=None):
+def run_repeated(cfg, repeats, seed, backend="baseline", simulate=None,
+                 record_every=40, workers=None):
     """Run a config `repeats` times; keep the fastest (lowest wall time) run."""
     best = None
     all_wall = []
     for _ in range(repeats):
-        m = run_once(cfg, seed, backend, simulate)
+        m = run_once(cfg, seed, backend, simulate, record_every, workers)
         all_wall.append(m["wall_time_s"])
         if best is None or m["wall_time_s"] < best["wall_time_s"]:
             best = m
@@ -345,6 +393,17 @@ def main():
                              + " (default: baseline).")
     parser.add_argument("--repeats", type=int, default=1,
                         help="Repeat each run N times; keep the fastest (default: 1).")
+    parser.add_argument("--record-every", type=int, default=40, metavar="N",
+                        help="Optimized backends: log the voltage trace every N "
+                             "steps (state still advances every step). Bounds the "
+                             "trace buffer at large n_cells while keeping recording "
+                             "cost in the timing. <=0 disables recording entirely. "
+                             "Ignored for the baseline (which always records "
+                             "densely, as in the reference). Default: 40.")
+    parser.add_argument("--workers", type=int, default=None, metavar="W",
+                        help="Process count for --backend mp_intra (one sim's "
+                             "cells split across W workers). Default: os.cpu_count(). "
+                             "Ignored by the other backends.")
     parser.add_argument("--seed", type=int, default=1981,
                         help="RNG seed for reproducible initial state (default: 1981). "
                              "Use -1 for non-deterministic runs.")
@@ -386,11 +445,14 @@ def main():
         print(f"Warming up '{args.backend}' (JIT compilation)...")
         warm = make_config(selected[0], PARAM_SPECS[selected[0]]["values"][0])
         warm.update({"sim_seconds": 0.00002, "n_cells": 2})
-        run_once(warm, 0, args.backend, simulate)
+        run_once(warm, 0, args.backend, simulate, args.record_every)
 
     rows = []
+    workers_note = (f", workers={args.workers or os.cpu_count()}"
+                    if args.backend == "mp_intra" else "")
     print(f"Sweeping: {', '.join(selected)}  "
-          f"(backend={args.backend}, repeats={args.repeats}, seed={seed})\n")
+          f"(backend={args.backend}, repeats={args.repeats}, seed={seed}, "
+          f"record_every={args.record_every}{workers_note})\n")
     for param in selected:
         spec = PARAM_SPECS[param]
         for value in spec["values"]:
@@ -404,7 +466,8 @@ def main():
             # denominator hits zero). Record it as 'unstable' and keep sweeping
             # rather than aborting the whole run.
             try:
-                metrics = run_repeated(cfg, args.repeats, seed, args.backend, simulate)
+                metrics = run_repeated(cfg, args.repeats, seed, args.backend,
+                                       simulate, args.record_every, args.workers)
                 row.update({k: metrics.get(k) for k in METRIC_KEYS})
                 row["status"] = "ok"
                 print(f"[{param}={value}] "
@@ -440,6 +503,8 @@ def main():
     meta = {
         "timestamp": stamp,
         "backend": args.backend,
+        "record_every": args.record_every,
+        "workers": (args.workers or os.cpu_count()) if args.backend == "mp_intra" else None,
         "swept_params": selected,
         "repeats": args.repeats,
         "seed": seed,

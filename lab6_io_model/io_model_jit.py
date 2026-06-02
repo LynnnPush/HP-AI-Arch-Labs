@@ -51,13 +51,15 @@ def simulate(
     axon_Sodium_h, axon_Potassium_x,
     dend_Ca2Plus, dend_Calcium_r, dend_Potassium_s, dend_Hcurrent_q,
     g_CaL, n_cells, n_simsteps, delta, sim_seconds,
-    enable_gapjunctions, I_app, I_pulse10ms, record,
+    enable_gapjunctions, I_app, I_pulse10ms, record, record_every=1,
 ):
     """Scalar-njit Jacobi backend (same numerics as io_model_vec.simulate).
 
     All state args are (n_cells,) float64 arrays. Returns (v_trace, n_simsteps);
-    v_trace is (n_simsteps, n_cells, 4) (V_soma, V_axon, V_dend, t) if record,
-    else an empty array.
+    v_trace is (n_rec, n_cells, 4) (V_soma, V_axon, V_dend, t) if record, else an
+    empty array. record_every logs a row only every Nth step (state still
+    advances every step), so n_rec = ceil(n_simsteps / record_every); this keeps
+    the buffer bounded at large n_cells. record_every=1 is the original trace.
     """
     # Copy so the caller's seeded state is not mutated (validate reuses it).
     V_soma = V_soma.copy(); V_axon = V_axon.copy(); V_dend = V_dend.copy()
@@ -68,7 +70,8 @@ def simulate(
     dend_Potassium_s = dend_Potassium_s.copy(); dend_Hcurrent_q = dend_Hcurrent_q.copy()
 
     if record:
-        v_trace = np.empty((n_simsteps, n_cells, 4))
+        n_rec = (n_simsteps + record_every - 1) // record_every
+        v_trace = np.empty((n_rec, n_cells, 4))
     else:
         v_trace = np.empty((0, 0, 0))
     t = 0.0
@@ -78,6 +81,10 @@ def simulate(
         Vs = V_soma.copy()
         Va = V_axon.copy()
         Vd = V_dend.copy()
+
+        # Log this step only every record_every steps (keeps the buffer bounded).
+        do_record = record and (i_epoch % record_every == 0)
+        rec = i_epoch // record_every
 
         # O(N) gap: precompute sum(Vd) once; I_gap[i] = C_gap*(N*Vd[i] - Sd).
         Sd = 0.0
@@ -91,11 +98,11 @@ def simulate(
         for i in range(n_cells):
             vs = Vs[i]; va = Va[i]; vd = Vd[i]  # this cell's start-of-step V
 
-            if record:
-                v_trace[i_epoch, i, 0] = vs
-                v_trace[i_epoch, i, 1] = va
-                v_trace[i_epoch, i, 2] = vd
-                v_trace[i_epoch, i, 3] = t
+            if do_record:
+                v_trace[rec, i, 0] = vs
+                v_trace[rec, i, 1] = va
+                v_trace[rec, i, 2] = vd
+                v_trace[rec, i, 3] = t
 
             # ---------------- SOMA (reads snapshot vs, va, vd) ----------------
             soma_I_leak = g_ls * (vs - V_l)
