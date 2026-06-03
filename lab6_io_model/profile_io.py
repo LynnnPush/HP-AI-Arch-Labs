@@ -12,7 +12,7 @@ import pstats
 import io as _io
 import numpy as np
 
-import io_model as M
+import lab6_io_model.cpu.io_model as M
 
 
 def build_state(n_cells, seed=1981):

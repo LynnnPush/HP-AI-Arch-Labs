@@ -44,7 +44,7 @@ import numpy as np
 
 # Import the model under test. Importing only defines the functions / default
 # globals; the simulation in its __main__ block does NOT run on import.
-import io_model
+import lab6_io_model.cpu.io_model as io_model
 
 
 # ---------------------------------------------------------------------------
@@ -55,28 +55,30 @@ import io_model
 # Optimized modules are imported lazily so a baseline-only run does not require
 # numba to be installed.
 # ---------------------------------------------------------------------------
-BACKENDS = ("baseline", "vec", "jit", "vec_jit", "mp_intra")
+BACKENDS = ("baseline", "vec", "jit", "vec_jit", "mp_intra", "jax_gpu")
 _JIT_BACKENDS = {"jit", "vec_jit"}
 # Backends whose simulate(...) accepts the local (k-nearest-neighbour) gap-junction
-# args (use_knn, neighbours). Only the scalar-njit jit backend implements it; the
-# others always use all-to-all coupling regardless of the --knn flag.
-_KNN_BACKENDS = {"jit"}
-# mp_intra is special: it is NOT a module.simulate(...) backend. It splits one
-# sim's cells across processes, building its OWN shared-memory state and spawning
-# workers, so it has no entry here and is driven by _step_intra (not
-# _step_optimized). It self-warms its njit kernels, so it is not in _JIT_BACKENDS.
+# args (use_knn, neighbours). The scalar-njit jit backend and the JAX GPU backend
+# both implement it; the others always use all-to-all coupling regardless of the
+# --knn flag.
+_KNN_BACKENDS = {"jit", "jax_gpu"}
+# mp_intra and jax_gpu are special: NEITHER is a CPU module.simulate(...) backend.
+# mp_intra splits one sim's cells across processes (its own shared-memory state +
+# workers), driven by _step_intra. jax_gpu has a different (pure, pytree-state)
+# signature and is driven by _step_jax. Both self-warm their own JIT/XLA kernels,
+# so neither is in _JIT_BACKENDS (whose generic warm-up uses the CPU signature).
 _BACKEND_MODULES = {
-    "vec": "io_model_vec",
-    "jit": "io_model_jit",
-    "vec_jit": "io_model_vec_jit",
+    "vec": "lab6_io_model.cpu.io_model_vec",
+    "jit": "lab6_io_model.cpu.io_model_jit",
+    "vec_jit": "lab6_io_model.cpu.io_model_vec_jit",
 }
 
 
 def resolve_backend(backend):
-    """Return the simulate(...) callable for an optimized backend, or None for
-    the baseline / mp_intra (driven by their own step functions, not a shared
-    module.simulate signature)."""
-    if backend in ("baseline", "mp_intra"):
+    """Return the simulate(...) callable for a CPU optimized backend, or None for
+    the baseline / mp_intra / jax_gpu (driven by their own step functions, not the
+    shared CPU module.simulate signature)."""
+    if backend in ("baseline", "mp_intra", "jax_gpu"):
         return None
     import importlib
     return importlib.import_module(_BACKEND_MODULES[backend]).simulate
@@ -265,7 +267,7 @@ def _step_intra(cfg, n_cells, delta, record_every, workers, seed):
     `record_every` follows the same convention as the other backends (stride for
     the bounded trace; <=0 disables recording). Imported lazily so a baseline
     sweep still needs no numba."""
-    from mp_sims_intra import simulate_intra
+    from lab6_io_model.cpu.mp_sims_intra import simulate_intra
 
     record = record_every > 0
     stride = record_every if record else 1
@@ -283,8 +285,53 @@ def _step_intra(cfg, n_cells, delta, record_every, workers, seed):
     return elapsed, cpu_time
 
 
+def _step_jax(cfg, st, n_cells, n_simsteps, delta, record_every,
+              use_knn, k, seed, dtype):
+    """Drive the JAX/XLA GPU backend (lab6_io_model.gpu.io_model_jax) once and
+    return (wall_time, cpu_time).
+
+    Unlike the CPU backends, this one has a pure, pytree-state signature, so it
+    cannot go through _step_optimized. The flow mirrors Goal D: build the device
+    state ONCE (HtoD, excluded from timing -- it is setup, like the CPU state
+    build), then time only the compiled scan. The first call for a given
+    (n_simsteps, n_cells, flags) signature COMPILES the XLA graph; we run it once
+    to warm/cache that compile out of the timed region, then time the second call.
+    block_until_ready forces JAX's async dispatch to complete before the clock
+    stops (timing the launch alone would be meaningless). `cpu_time` from
+    process_time is only a coarse host-side number on GPU (the device work is off
+    the CPU clock); wall_time is the meaningful metric here.
+
+    `record_every` follows the other backends' convention (stride for the bounded
+    trace; <=0 disables recording -> the throughput path emits nothing per step).
+    `dtype` selects the Goal-E precision (f32 default / f64 if --jax-x64)."""
+    import jax
+    from lab6_io_model.gpu import io_model_jax as jx
+
+    record = record_every > 0
+    stride = record_every if record else 1
+    pos_seed = seed if seed is not None else 1981
+
+    # On-device initial state + kNN adjacency, built outside the timed region.
+    state, g_CaL = jx.state_from_dict(st, dtype=dtype)
+    neighbours = jx.build_neighbours(n_cells, k=k, seed=pos_seed) if use_knn else None
+
+    def call():
+        return jx.simulate(
+            state, g_CaL, neighbours, n_simsteps, delta, cfg["sim_seconds"],
+            cfg["enable_gapjunctions"], 0.0, cfg["I_pulse10ms"],
+            use_knn, record, stride)
+
+    # Warm/compile (cached in-process by static-arg + shape signature); excluded.
+    jax.block_until_ready(call())
+
+    wall_tic = time.perf_counter()
+    cpu_tic = time.process_time()
+    jax.block_until_ready(call())
+    return time.perf_counter() - wall_tic, time.process_time() - cpu_tic
+
+
 def run_once(cfg, seed, backend="baseline", simulate=None, record_every=40,
-             workers=None, use_knn=False, k=8):
+             workers=None, use_knn=False, k=8, jax_x64=False):
     """Run a single simulation with the given config dict and return metrics.
 
     `backend` selects the io_model implementation ("baseline" or one of the
@@ -312,12 +359,20 @@ def run_once(cfg, seed, backend="baseline", simulate=None, record_every=40,
         st = build_initial_state(n_cells, cfg["g_CaL"], seed)
         if backend == "baseline":
             wall_time, cpu_time = _step_baseline(cfg, st, n_cells, n_simsteps, delta)
+        elif backend == "jax_gpu":
+            # JAX has its own pure pytree-state signature (not the CPU one), so it
+            # is driven by _step_jax. f64 (jax_x64) is enabled once in main().
+            import jax.numpy as jnp
+            dtype = jnp.float64 if jax_x64 else jnp.float32
+            wall_time, cpu_time = _step_jax(
+                cfg, st, n_cells, n_simsteps, delta, record_every,
+                effective_knn, k, seed, dtype)
         else:
             neighbours = None
             if effective_knn:
                 # Adjacency is built once here (outside the timed region) and reused
                 # every step. Positions are seeded so the topology is reproducible.
-                import io_model_jit
+                import lab6_io_model.cpu.io_model_jit as io_model_jit
                 pos_seed = seed if seed is not None else 1981
                 neighbours = io_model_jit.build_neighbours(n_cells, k=k, seed=pos_seed)
             wall_time, cpu_time = _step_optimized(
@@ -345,12 +400,13 @@ def run_once(cfg, seed, backend="baseline", simulate=None, record_every=40,
 
 
 def run_repeated(cfg, repeats, seed, backend="baseline", simulate=None,
-                 record_every=40, workers=None, use_knn=False, k=8):
+                 record_every=40, workers=None, use_knn=False, k=8, jax_x64=False):
     """Run a config `repeats` times; keep the fastest (lowest wall time) run."""
     best = None
     all_wall = []
     for _ in range(repeats):
-        m = run_once(cfg, seed, backend, simulate, record_every, workers, use_knn, k)
+        m = run_once(cfg, seed, backend, simulate, record_every, workers, use_knn,
+                     k, jax_x64)
         all_wall.append(m["wall_time_s"])
         if best is None or m["wall_time_s"] < best["wall_time_s"]:
             best = m
@@ -441,6 +497,11 @@ def main():
                         help="Number of nearest neighbours each cell couples to under "
                              "--knn (default: 8). Fixed regardless of n_cells, which is "
                              "what keeps large populations stable.")
+    parser.add_argument("--jax-x64", action="store_true",
+                        help="--backend jax_gpu only: run the JAX backend in float64 "
+                             "(exact, assignment-mandated; needs jax_enable_x64). "
+                             "Default is float32 -- the faster GPU throughput path "
+                             "(Goal E precision fork). Ignored by other backends.")
     parser.add_argument("--seed", type=int, default=1981,
                         help="RNG seed for reproducible initial state (default: 1981). "
                              "Use -1 for non-deterministic runs.")
@@ -479,6 +540,13 @@ def main():
     # is not charged to the first swept config's timing.
     simulate = resolve_backend(args.backend)
 
+    # JAX f64 must be enabled BEFORE any jnp array is created (it is process-global
+    # and cannot be flipped once jax has been used). Do it here, before the sweep
+    # loop builds any device state. f32 is the default fast GPU path (Goal E).
+    if args.backend == "jax_gpu" and args.jax_x64:
+        import jax
+        jax.config.update("jax_enable_x64", True)
+
     # Local kNN coupling only exists on the jit backend; warn (once) if requested
     # elsewhere so the all-to-all fallback is not a silent surprise.
     if args.knn and args.backend not in _KNN_BACKENDS:
@@ -516,7 +584,7 @@ def main():
             try:
                 metrics = run_repeated(cfg, args.repeats, seed, args.backend,
                                        simulate, args.record_every, args.workers,
-                                       args.knn, args.k)
+                                       args.knn, args.k, args.jax_x64)
                 row.update({k: metrics.get(k) for k in METRIC_KEYS})
                 row["status"] = "ok"
                 print(f"[{param}={value}] "
@@ -555,6 +623,7 @@ def main():
         "record_every": args.record_every,
         "knn": bool(args.knn and args.backend in _KNN_BACKENDS),
         "k": args.k,
+        "jax_dtype": ("float64" if args.jax_x64 else "float32") if args.backend == "jax_gpu" else None,
         "workers": (args.workers or os.cpu_count()) if args.backend == "mp_intra" else None,
         "swept_params": selected,
         "repeats": args.repeats,

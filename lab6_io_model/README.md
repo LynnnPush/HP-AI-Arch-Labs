@@ -1,12 +1,18 @@
-# Lab 6 — CPU Backend Optimization of the Inferior-Olive Model
+# Lab 6 — CPU + GPU Backend Optimization of the Inferior-Olive Model
 
 This lab takes the reference Inferior-Olive (de Gruijl) neuron simulator and
-speeds it up on the CPU, then scales it out across processes. The model
-integrates `n_cells` neurons, each with 3 compartments (soma / axon / dendrite)
-and ~15 state variables, coupled through dendritic gap junctions.
+speeds it up on the CPU, scales it out across processes, then ports it to the GPU
+with JAX + XLA. The model integrates `n_cells` neurons, each with 3 compartments
+(soma / axon / dendrite) and ~15 state variables, coupled through dendritic gap
+junctions.
 
-There are **three optimized single-sim backends** plus a **multiprocessing**
-driver, all validated against the untouched reference.
+There are **three optimized single-sim CPU backends** plus a **multiprocessing**
+driver and a **JAX/XLA GPU backend**, all validated against the untouched
+reference.
+
+The single-file backends are split by hardware target: the CPU ones live under
+`cpu/`, the GPU one under `gpu/`. The harness scripts (`sweep.py`, `validate.py`,
+`profile_io.py`) stay at the top level and import both.
 
 ---
 
@@ -14,15 +20,16 @@ driver, all validated against the untouched reference.
 
 | File | What it is |
 |------|------------|
-| `io_model.py` | **Reference** baseline (unchanged). Pure-Python scalar loops, Gauss-Seidel update order, O(N²) all-to-all gap junction. The correctness/standard reference. |
-| `io_model_vec.py` | **vec** — vectorized NumPy over all cells. Jacobi double-buffer + O(N) closed-form gap junction. |
-| `io_model_jit.py` | **jit** — scalar per-cell loops compiled with Numba `@njit`. Same Jacobi + O(N) numerics as `vec`. Fastest single-sim backend. Also offers optional **local (k-nearest-neighbour) gap-junction coupling** (`use_knn` + `build_neighbours`) that stays stable at large `n_cells`. |
-| `io_model_vec_jit.py` | **vec_jit** — `@njit` applied to the *vectorized* loop. Same numerics again; shows the cost of array temporaries under JIT. |
-| `validate.py` | Runs the baseline + chosen backends from one seeded state; reports speedup, divergence-vs-baseline, and machine-epsilon equality among the optimized backends. Both multiprocessing schemes (`mp`, `mp_intra`) are selectable too — a pure numeric check that they reproduce the `jit` numerics. |
-| `sweep.py` | Parameter-sweep / performance harness for **any backend** (`--backend baseline\|vec\|jit\|vec_jit\|mp_intra`): wall/CPU time, throughput, latency, real-time factor. Catches unstable configs and records them rather than aborting. Supports local kNN gap-junction coupling on the jit backend (`--knn`, **default on**). |
+| `cpu/io_model.py` | **Reference** baseline (unchanged). Pure-Python scalar loops, Gauss-Seidel update order, O(N²) all-to-all gap junction. The correctness/standard reference. |
+| `cpu/io_model_vec.py` | **vec** — vectorized NumPy over all cells. Jacobi double-buffer + O(N) closed-form gap junction. |
+| `cpu/io_model_jit.py` | **jit** — scalar per-cell loops compiled with Numba `@njit`. Same Jacobi + O(N) numerics as `vec`. Fastest single-sim CPU backend. Also offers optional **local (k-nearest-neighbour) gap-junction coupling** (`use_knn` + `build_neighbours`) that stays stable at large `n_cells`. |
+| `cpu/io_model_vec_jit.py` | **vec_jit** — `@njit` applied to the *vectorized* loop. Same numerics again; shows the cost of array temporaries under JIT. |
+| `gpu/io_model_jax.py` | **jax_gpu** — JAX + XLA GPU backend. Pure functional step (Goal A, immutable Jacobi) fused over the whole time loop with `jax.jit` + `lax.scan` (Goal B): **one XLA graph, one launch per sim**. Supports the same local kNN / all-to-all gap and f32 (fast) / f64 (exact) precision. Runs on CPU too when no GPU is visible. Batching across networks (`vmap`, Goal C) is the next layer and not yet wired. |
+| `validate.py` | Runs the baseline + chosen backends from one seeded state; reports speedup, divergence-vs-baseline, and machine-epsilon equality among the optimized backends. The multiprocessing schemes (`mp`, `mp_intra`) and the GPU backend (`jax`) are selectable too — a pure numeric check that each reproduces the `jit` numerics. |
+| `sweep.py` | Parameter-sweep / performance harness for **any backend** (`--backend baseline\|vec\|jit\|vec_jit\|mp_intra\|jax_gpu`): wall/CPU time, throughput, latency, real-time factor. Catches unstable configs and records them rather than aborting. Supports local kNN gap-junction coupling on the jit/jax_gpu backends (`--knn`, **default on**). |
 | `profile_io.py` | `cProfile` breakdown of the baseline (per-compartment cost, gap-junction on/off, scaling with N). |
-| `mp_sims.py` | Multiprocessing across **independent** sims, using the `jit` backend as the per-sim backbone. |
-| `mp_sims_intra.py` | Multiprocessing **within one** sim: splits the cells of a single sim across processes (domain decomposition). State lives in shared memory; the only per-step IPC is the global gap-junction sum (`Sd`) all-reduce + a barrier. |
+| `cpu/mp_sims.py` | Multiprocessing across **independent** sims, using the `jit` backend as the per-sim backbone. |
+| `cpu/mp_sims_intra.py` | Multiprocessing **within one** sim: splits the cells of a single sim across processes (domain decomposition). State lives in shared memory; the only per-step IPC is the global gap-junction sum (`Sd`) all-reduce + a barrier. |
 | `sweep_results/` | CSV/JSON output from `sweep.py`. |
 
 ---
@@ -33,17 +40,20 @@ The baseline updates cells **sequentially** within a timestep, so the axon/dend
 of a cell see the *freshly updated* soma voltage, and the gap junction sees
 already-updated neighbours (**Gauss-Seidel**).
 
-All three optimized backends compute every derivative from a **start-of-step
-snapshot** and write the three coupled voltages together (**Jacobi**), which is
-what enables vectorization and the O(N)→ closed-form gap junction.
+Every optimized backend computes each derivative from a **start-of-step
+snapshot** and writes the three coupled voltages together (**Jacobi**), which is
+what enables vectorization and the O(N)→ closed-form gap junction. On the JAX
+backend this is not even a choice: JAX arrays are immutable, so the step reads the
+old state and returns new arrays — the Jacobi double-buffer is *structural*.
 
 Consequence: the optimized backends are **not bit-identical** to the baseline —
 they use a different (equally valid) integration scheme, so traces drift apart
 over time in this chaotic system. Therefore:
 
 - **optimized vs baseline** → *divergence* (measured, not asserted equal),
-- **optimized vs optimized** (vec / vec_jit / jit) → *equality* to machine
-  epsilon (they share identical Jacobi + O(N) formulas).
+- **optimized vs optimized** (vec / vec_jit / jit / jax) → *equality* to machine
+  epsilon (they share identical Jacobi + O(N) formulas; the f64 JAX backend
+  matches to ~epsilon, an f32 JAX run drifts within an f32 tolerance instead).
 
 
 ---
@@ -55,26 +65,40 @@ over time in this chaotic system. Therefore:
 > packages; the bare `python` on that host does *not*). **On the Linux server the
 > interpreter will differ** — use whatever the server provides (`python3`, a
 > `module load python/...`, or an activated venv/conda env) and substitute it for
-> `py -3` everywhere. Requires `numpy` + `matplotlib`, and `numba` for the JIT
-> backends (`io_model_jit.py`, `io_model_vec_jit.py`); install with
-> `<your-python> -m pip install numba` if missing.
+> `py -3` everywhere. Requires `numpy` + `matplotlib`, `numba` for the JIT
+> backends (`cpu/io_model_jit.py`, `cpu/io_model_vec_jit.py`), and `jax` for the
+> GPU backend (`gpu/io_model_jax.py`); install with
+> `<your-python> -m pip install numba jax` (add the CUDA `jax[cuda12]` wheel on the
+> GPU host) if missing.
+
+> **Running the harness scripts.** `sweep.py` / `validate.py` import the backends
+> by package path (`lab6_io_model.cpu.*` / `lab6_io_model.gpu.*`) **and** import
+> each other by bare name (`from sweep import …`), so both the repo root
+> (`labs_scripts/`) and this folder (`lab6_io_model/`) must be on the path. Run
+> them from this folder with both on `PYTHONPATH`, e.g. (bash)
+> `PYTHONPATH="..:." py -3 sweep.py …`. The single-file backends below are
+> self-contained and need no such setup.
 
 ### Run a single backend directly
 
 Each backend's `__main__` runs the default config (30 cells, 1.0 s, δ=0.01),
-prints its execution time, and plots the soma traces. The JIT backends warm up
-(compile) before the timed run.
+prints its execution time, and plots the soma traces. The JIT / JAX backends warm
+up (compile) before the timed run.
 
 ```bash
-py -3 io_model.py          # baseline reference
-py -3 io_model_vec.py      # vectorized
-py -3 io_model_jit.py      # scalar njit (fastest)
-py -3 io_model_vec_jit.py  # njit on the vectorized loop
+py -3 cpu/io_model.py          # baseline reference
+py -3 cpu/io_model_vec.py      # vectorized
+py -3 cpu/io_model_jit.py      # scalar njit (fastest CPU)
+py -3 cpu/io_model_vec_jit.py  # njit on the vectorized loop
+py -3 gpu/io_model_jax.py      # JAX + XLA (jit + lax.scan); runs on CPU if no GPU
 ```
 
-`io_model_jit.py`'s `__main__` runs with local k-nearest-neighbour gap-junction
-coupling by default (the `USE_KNN` / `K` toggle at the top, matching `sweep.py`);
-set `USE_KNN = False` to fall back to the original all-to-all coupling.
+`cpu/io_model_jit.py`'s `__main__` runs with local k-nearest-neighbour
+gap-junction coupling by default (the `USE_KNN` / `K` toggle at the top, matching
+`sweep.py`); set `USE_KNN = False` to fall back to the original all-to-all
+coupling. `gpu/io_model_jax.py` has the same toggle and defaults to **float64**
+(`jax_enable_x64`) so its demo trace lines up with the CPU backends; it reports
+the one-time XLA compile (warm-up) time separately from the timed run.
 
 ### Validate + compare backends
 
@@ -94,12 +118,18 @@ py -3 validate.py --backends vec vec_jit jit --sim-seconds 0.2
 
 # numeric check of the two multiprocessing schemes vs the baseline/jit
 py -3 validate.py --backends jit mp mp_intra --sim-seconds 0.2
+
+# GPU backend vs the CPU jit (both f64, all-to-all -> equality to ~machine epsilon)
+py -3 validate.py --backends jit jax --sim-seconds 0.2
 ```
 
-Flags: `--backends {vec,vec_jit,jit,mp,mp_intra,all}`, `--sim-seconds`,
+Flags: `--backends {vec,vec_jit,jit,mp,mp_intra,jax,all}`, `--sim-seconds`,
 `--n-cells`, `--delta`, `--seed`. Output has three parts: a timing/speedup line,
 per-backend divergence vs baseline, and (when ≥2 backends are selected) an
-equality cross-check.
+equality cross-check. The `jax` backend runs in **float64** and **all-to-all**
+coupling (matching the other validate backends), and is warmed at the real shape
+before timing; it compiles per shape, so its first run at a new `--n-cells` /
+`--sim-seconds` pays a one-time XLA compile.
 
 Representative result (N=30, 0.2 s = 20,000 steps):
 
@@ -209,14 +239,16 @@ py -3 sweep.py n_cells --backend jit      # sweep n_cells on the jit backend (kN
 py -3 sweep.py n_cells --backend jit --no-knn   # same sweep, original all-to-all coupling
 py -3 sweep.py all --backend vec_jit      # full sweep on vec_jit
 py -3 sweep.py n_cells --backend mp_intra --workers 4   # intra-sim parallel backend
+py -3 sweep.py n_cells --backend jax_gpu                # JAX/XLA GPU backend (f32 default)
+py -3 sweep.py n_cells --backend jax_gpu --jax-x64      # GPU in f64 (exact)
 py -3 profile_io.py                       # cProfile breakdown of the baseline
 ```
 
-Flags: `--backend {baseline,vec,jit,vec_jit,mp_intra}` (default `baseline`),
-`--repeats`, `--seed`, `--outdir`, plus `--knn`/`--k`, `--record-every`, and
-`--workers` documented below. JIT backends
-are warmed up (compiled) once before timing so compilation is not charged to the
-first run. Results are written to
+Flags: `--backend {baseline,vec,jit,vec_jit,mp_intra,jax_gpu}` (default
+`baseline`), `--repeats`, `--seed`, `--outdir`, plus `--knn`/`--k`,
+`--record-every`, `--workers`, and `--jax-x64` documented below. The JIT/JAX
+backends are warmed up (compiled) once before timing so compilation is not charged
+to the first run. Results are written to
 `sweep_results/sweep_<backend>_<params>_<stamp>.{csv,json}`.
 
 **`--workers W` (mp_intra only).** Process count for the intra-sim parallel
@@ -243,24 +275,49 @@ py -3 sweep.py n_cells --backend jit --record-every 40   # bounded trace
 py -3 sweep.py n_cells --backend jit --record-every 0    # no recording
 ```
 
-**`--knn` / `--no-knn` (default `--knn`) and `--k K` (default 8) — jit only.**
+**`--knn` / `--no-knn` (default `--knn`) and `--k K` (default 8) — jit & jax_gpu.**
 Local gap-junction coupling: each cell couples only to its `K` nearest neighbours
 instead of every other cell. Because the coupling degree is fixed at `K`
 regardless of population, the per-step dendritic update no longer grows with
 `n_cells`, so large populations stay numerically stable (and the topology is also
 more biologically faithful — real olivary gap junctions are local, not all-to-all).
-The neighbour list is built once per config with `io_model_jit.build_neighbours`
-(random positions + KD-tree) **outside** the timed region, then a per-timestep
-neighbour-sum keeps the gap term O(1) per cell — the same precompute-the-sum trick
-as the all-to-all path, restricted to a fixed neighbour set. `--no-knn` restores
-the original all-to-all coupling. Only the `jit` backend implements this; on any
-other backend the flag is ignored (a one-line note is printed) and coupling stays
-all-to-all.
+The neighbour list is built once per config (random positions + KD-tree)
+**outside** the timed region, then a per-timestep neighbour-sum keeps the gap term
+O(1) per cell — the same precompute-the-sum trick as the all-to-all path,
+restricted to a fixed neighbour set (a gather + segment-sum on the GPU). `--no-knn`
+restores the original all-to-all coupling. Only the `jit` and `jax_gpu` backends
+implement this; on any other backend the flag is ignored (a one-line note is
+printed) and coupling stays all-to-all.
 
 ```bash
 py -3 sweep.py n_cells --backend jit            # kNN (default): stable past 1000 cells
 py -3 sweep.py n_cells --backend jit --k 16     # denser local coupling
 py -3 sweep.py n_cells --backend jit --no-knn   # all-to-all: goes unstable above ~4000 cells
+```
+
+**`--jax-x64` (jax_gpu only).** Run the JAX backend in **float64** instead of the
+default **float32**. f32 is the fast GPU throughput path (≈2× faster, half the
+memory); f64 is the exact, assignment-mandated path and is what the `validate.py`
+equality check uses. The flag flips JAX's process-global `jax_enable_x64` before
+any device array is built. Choosing between them is the plan's one measured
+"precision fork" (Goal E) — decide by the f32-vs-f64 trace drift, not by
+assumption. The recorded precision is stored as `jax_dtype` in the result JSON.
+Like the other compiled backends, `jax_gpu` self-warms: the first run at a given
+`(n_simsteps, n_cells, flags)` shape compiles the XLA graph (one-time, excluded
+from timing), and `--repeats` reuses the cached compile.
+
+> **Note on the GPU win (Goals C–E).** This backend currently runs **one** network
+> per call (`S=1`). The time loop is irreducibly serial, so a single small network
+> exposes only ~`n_cells` lanes — nowhere near a GPU's width, and at `S=1` the GPU
+> typically *loses* to the CPU `jit` backbone. The throughput win comes from
+> batching many independent networks with `vmap` (Goal C: arrays become `(S, N)`),
+> which is the next layer and not yet wired into the sweep. Report **throughput**
+> (`S·T / wall`) for the GPU, not single-sim latency.
+
+```bash
+py -3 sweep.py n_cells --backend jax_gpu            # f32, kNN (default)
+py -3 sweep.py n_cells --backend jax_gpu --jax-x64  # f64 (exact), kNN
+py -3 sweep.py n_cells --backend jax_gpu --no-knn   # all-to-all coupling
 ```
 
 **Unstable configs are caught, not fatal.** With all-to-all coupling (`--no-knn`,
@@ -278,11 +335,22 @@ goes up to 5000 specifically to exercise this threshold: under the default kNN
 coupling every value is stable, while `--no-knn` flags the 5000-cell point
 (and on the jit backend nothing else) as unstable.
 
+> **Caveat — `jax_gpu` does not raise on blow-up.** XLA produces `NaN`/`inf`
+> *silently* (no Python exception), so the sweep's `try/except` cannot flag an
+> unstable JAX config — it reports `status = ok` with a real wall time but
+> `NaN`-poisoned traces. Stay on the default `--knn` coupling (stable at large
+> `n_cells`), and treat f32 with extra care: the explicit-Euler gates are stiff, so
+> `--no-knn` or very large populations in f32 can go non-finite without warning.
+
 ---
 
 ## Suggested workflow
 
 1. Profile the baseline (`profile_io.py`) to see where the time goes.
 2. Validate the optimized backends against the baseline (`validate.py`) — confirm
-   speedup, bounded divergence, and machine-epsilon agreement.
-3. Pick `jit` as the single-sim backbone and scale out with `mp_sims.py`.
+   speedup, bounded divergence, and machine-epsilon agreement (include `jax` to
+   check the GPU port in f64).
+3. Pick `jit` as the single-sim CPU backbone and scale out with `mp_sims.py`.
+4. For the GPU, decide the precision fork (`--jax-x64` f64 vs default f32) from the
+   measured trace drift, then batch many networks (`vmap`, Goal C) for the
+   throughput win — single small sims stay on the CPU backbone.

@@ -16,7 +16,7 @@ import time
 
 import numpy as np
 
-import io_model_jit
+import lab6_io_model.cpu.io_model_jit as io_model_jit
 from sweep import build_initial_state
 
 SPIKE_THRESHOLD = -20.0  # mV; soma upward crossings counted as spikes

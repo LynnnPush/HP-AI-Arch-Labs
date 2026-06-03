@@ -37,12 +37,12 @@ import time
 import numpy as np
 from numba import njit
 
-import io_model_jit
+import lab6_io_model.cpu.io_model_jit as io_model_jit
 from sweep import build_initial_state
 
 # Model constants -- imported so the njit kernel freezes the SAME values as the
 # single-process jit backend (keeps numerics bit-identical to io_model_jit).
-from io_model_jit import (
+from lab6_io_model.cpu.io_model_jit import (
     g_int, p1, p2, g_h, g_K_Ca, g_ld, g_la, g_ls, S,
     g_Na_s, g_Kdr_s, g_K_s, g_CaH, g_Na_a, g_K_a,
     V_Na, V_K, V_Ca, V_h, V_l, C_gap,

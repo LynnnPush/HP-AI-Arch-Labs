@@ -18,12 +18,12 @@ import numpy as np
 
 # io_model defines the update_* helpers + default globals; importing it does NOT
 # run its __main__ simulation. sweep gives us the seeded state initializer.
-import io_model
-import io_model_vec
-import io_model_vec_jit
-import io_model_jit
-import mp_sims
-import mp_sims_intra
+import lab6_io_model.cpu.io_model as io_model
+import lab6_io_model.cpu.io_model_vec as io_model_vec
+import lab6_io_model.cpu.io_model_vec_jit as io_model_vec_jit
+import lab6_io_model.cpu.io_model_jit as io_model_jit
+import lab6_io_model.cpu.mp_sims as mp_sims
+import lab6_io_model.cpu.mp_sims_intra as mp_sims_intra
 from sweep import build_initial_state
 
 
@@ -185,18 +185,49 @@ def run_mp_intra_trace(n_cells=30, sim_seconds=1.0, delta=0.01,
     return v_trace, n_simsteps
 
 
+def run_jax_trace(n_cells=30, sim_seconds=1.0, delta=0.01,
+                  enable_gapjunctions=True, I_app=0.0, I_pulse10ms=2.0,
+                  g_CaL=None, seed=1981, record=True):
+    """Run the JAX/XLA GPU backend (jit + lax.scan) from the same seeded state.
+
+    Returns (v_trace, n_simsteps) in the (n_simsteps, n_cells, 4) io_model layout.
+    Two deliberate choices make this a clean equality check against the CPU `jit`:
+      * float64 (jax_enable_x64) -- so the Jacobi + O(N) numerics match `jit` to
+        machine epsilon, not just an f32 tolerance (the f32/f64 drift is its own
+        measurement, Goal E, not this comparison).
+      * all-to-all gap junction (use_knn=False) -- the other validate backends all
+        use all-to-all coupling, so jax must too for an apples-to-apples trace.
+    Like the njit backends, the FIRST call compiles (per shape) -- warmup_jit()
+    handles that at the real shape before any timed region."""
+    import jax
+    jax.config.update("jax_enable_x64", True)  # f64; idempotent, set before jnp use
+    import jax.numpy as jnp
+    from lab6_io_model.gpu import io_model_jax as jx
+
+    st = build_initial_state(n_cells, g_CaL, seed)
+    n_simsteps = int(sim_seconds * 1000 / delta + 0.5)
+    state, g_CaL_arr = jx.state_from_dict(st, dtype=jnp.float64)
+    v_trace, _final, _ = jx.simulate(
+        state, g_CaL_arr, None, n_simsteps, delta, sim_seconds,
+        enable_gapjunctions, I_app, I_pulse10ms,
+        use_knn=False, record=record, record_every=1)
+    return np.asarray(jax.block_until_ready(v_trace)), n_simsteps
+
+
 # Registry of optimized backends selectable on the command line. Order here is
 # the canonical print order. _NEEDS_WARMUP marks the njit-compiled ones. The two
 # `mp*` entries are the multiprocessing schemes (across-sims and within-sim);
-# they self-warm their own JIT kernels, so they are not in _NEEDS_WARMUP. This
-# is purely a NUMERIC check -- for a fair speed comparison of the two schemes
-# (throughput vs latency) see mp_bench.py.
+# they self-warm their own JIT kernels, so they are not in _NEEDS_WARMUP. `jax`
+# is the JAX/XLA GPU backend; it compiles per shape, so it IS warmed (at the real
+# validation shape -- see warmup_jit). This is purely a NUMERIC check -- for a
+# fair speed comparison see the benchmark sweep (sweep.py --backend jax_gpu).
 BACKENDS = {
     "vec": run_vec_trace,
     "vec_jit": run_vec_jit_trace,
     "jit": run_jit_trace,
     "mp": run_mp_trace,
     "mp_intra": run_mp_intra_trace,
+    "jax": run_jax_trace,
 }
 _NEEDS_WARMUP = {"vec_jit", "jit"}
 
@@ -271,6 +302,11 @@ if __name__ == "__main__":
 
     import time
     warmup_jit(selected)  # compile only the njit backends we'll actually time
+    # JAX compiles per shape, so warm it at the REAL validation shape (record=True,
+    # matching the timed call below) -- otherwise the per-shape XLA compile would be
+    # charged to its timed run and the reported speedup would be meaningless.
+    if "jax" in selected:
+        run_jax_trace(**kw)
 
     # Baseline is always the reference everything is compared against.
     t = time.process_time()
