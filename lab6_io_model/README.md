@@ -270,9 +270,20 @@ steps × 10k cells × 4 × 8 B ≈ 32 GB). `--record-every 0` disables recording
 entirely for the very largest runs. The baseline always records densely (it
 drives the reference `update_*` helpers, which log every step).
 
+The `jax_gpu` backend honours this **on-device too**: rather than emitting one
+sample per step into a `(n_simsteps, n_cells, 3)` device buffer and slicing after
+(which would OOM the GPU at large `n_cells`), `simulate` uses a **nested
+`lax.scan`** — an outer scan over the `n_rec = ceil(n_simsteps / N)` blocks emits
+one strided sample each, while an inner scan advances `N` steps emitting nothing.
+The recorded buffer is `(n_rec, n_cells, 3)`, i.e. `N×` smaller, and the recorded
+step positions match the CPU backends exactly (the last block is handled
+separately so the loop still advances *exactly* `n_simsteps` steps). `--record-every
+0` takes the throughput path (no per-step output; only the final state returns).
+
 ```bash
-py -3 sweep.py n_cells --backend jit --record-every 40   # bounded trace
-py -3 sweep.py n_cells --backend jit --record-every 0    # no recording
+py -3 sweep.py n_cells --backend jit --record-every 40       # bounded trace
+py -3 sweep.py n_cells --backend jit --record-every 0        # no recording
+py -3 sweep.py n_cells --backend jax_gpu --record-every 40   # strided on-device (N× smaller buffer)
 ```
 
 **`--knn` / `--no-knn` (default `--knn`) and `--k K` (default 8) — jit & jax_gpu.**

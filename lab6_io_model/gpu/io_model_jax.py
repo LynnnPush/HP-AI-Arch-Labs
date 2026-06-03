@@ -115,10 +115,9 @@ def state_from_dict(st, dtype=jnp.float64):
 
 
 def _make_step(g_CaL, neighbours, delta, sim_seconds,
-               enable_gapjunctions, I_app, I_pulse10ms, use_knn, record):
-    """Build the pure functional step closure (Goal A) used by BOTH the eager
-    runner and the `lax.scan` simulate (Goal B), so they are provably the same
-    numerics ("scan == eager" validation).
+               enable_gapjunctions, I_app, I_pulse10ms, use_knn):
+    """Build the pure functional step closure (Goal A) -- the per-network advance
+    used as the body of every (inner) lax.scan in simulate (Goal B).
 
     Closed-over (per-call constant) values:
       * g_CaL    -- (n_cells,) per-cell Ca conductance; under vmap this becomes a
@@ -126,12 +125,13 @@ def _make_step(g_CaL, neighbours, delta, sim_seconds,
       * neighbours -- (n_cells, k) int adjacency for local kNN gap, or None for
                     all-to-all. Same topology shared across a vmap batch.
       * delta, sim_seconds, I_app, I_pulse10ms -- scalars (may be traced).
-      * use_knn, enable_gapjunctions, record -- Python bools, static at trace time
-                    so the gap branch / output branch is chosen once, not per step.
+      * use_knn, enable_gapjunctions -- Python bools, static at trace time so the
+                    gap branch is chosen once, not per step.
 
-    Returns step(carry, t_idx) -> (new_carry, y) where carry/new_carry are
-    IOState and y is the start-of-step (Vs, Va, Vd) stack when `record`, else None
-    (the throughput path emits nothing per step -- Goal D's DtoH guard).
+    Returns step(carry, t_idx) -> new_carry, both IOState. It emits NO per-step
+    output: recording is done at the block boundaries by simulate's outer scan, so
+    the recorded buffer is bounded at (n_rec, ...) instead of (n_simsteps, ...).
+    The start-of-step snapshot a recorder needs is just the incoming `carry`.
     """
     k_deg = neighbours.shape[1] if (use_knn and neighbours is not None) else 0
 
@@ -274,29 +274,31 @@ def _make_step(g_CaL, neighbours, delta, sim_seconds,
             dend_Potassium_s=dend_Potassium_s_new, dend_Hcurrent_q=dend_Hcurrent_q_new,
         )
 
-        # Record the START-of-step potentials (matches the CPU backends, which log
-        # each compartment's V before writing it). Stacked last-axis -> (n_cells, 3).
-        y = jnp.stack([Vs, Va, Vd], axis=-1) if record else None
-        return new_carry, y
+        return new_carry
 
     return step
 
 
-def _assemble_trace(ys, n_simsteps, delta, record_every):
-    """Turn the scan's per-step (n_simsteps, n_cells, 3) stack into the CPU-style
-    (n_rec, n_cells, 4) trace (columns V_soma, V_axon, V_dend, t), downsampled by
-    `record_every` to bound the buffer.
+def _attach_time(samples, delta, record_every):
+    """Glue the time column onto an already-strided (n_rec, n_cells, 3) sample
+    stack -> the CPU-style (n_rec, n_cells, 4) trace (cols V_soma, V_axon, V_dend,
+    t). Sample j is the start-of-step snapshot at global step j*record_every, so
+    its time is j*record_every*delta (matches the CPU backends' time column)."""
+    n_rec, n_cells = samples.shape[0], samples.shape[1]
+    t_col = (jnp.arange(n_rec, dtype=samples.dtype) * record_every) * delta
+    t_col = jnp.broadcast_to(t_col[:, None, None], (n_rec, n_cells, 1))
+    return jnp.concatenate([samples, t_col], axis=-1)
 
-    Goal D note: this materializes the full per-step stack first and slices after,
-    which is fine for the small single-network VALIDATION runs (S=1). Throughput
-    runs must pass record=False so the scan emits nothing per step and nothing
-    crosses PCIe -- never assemble a dense trace at large S*N*T (the 6-18 GB trap).
-    """
-    ys = ys[::record_every]                                   # (n_rec, n_cells, 3)
-    n_rec = ys.shape[0]
-    t_col = (jnp.arange(n_rec, dtype=ys.dtype) * record_every) * delta
-    t_col = jnp.broadcast_to(t_col[:, None, None], (n_rec, ys.shape[1], 1))
-    return jnp.concatenate([ys, t_col], axis=-1)              # (n_rec, n_cells, 4)
+
+def _advance(step, carry, start_idx, length):
+    """Advance `carry` exactly `length` steps with an inner lax.scan that emits
+    NOTHING (ys=None) -- this is what keeps device memory bounded: no per-step
+    buffer is ever materialized. Global step indices start at `start_idx` (a
+    tracer) so the pulse-window timing inside `step` stays correct; `length` is a
+    Python int (static), which fixes the scan trip count."""
+    xs = start_idx + jnp.arange(length)
+    final, _ = lax.scan(lambda c, i: (step(c, i), None), carry, xs)
+    return final
 
 
 @partial(jax.jit, static_argnames=(
@@ -314,12 +316,22 @@ def simulate(state, g_CaL, neighbours,
     specializes the graph; delta/sim_seconds/I_* are traced so changing a current
     amplitude does NOT force a recompile.
 
+    Recording is STRIDED ON-DEVICE (the OOM fix). Rather than emitting one sample
+    per step into a (n_simsteps, n_cells, 3) buffer and slicing after -- which
+    materializes the full dense history and OOMs at large n_cells -- the loop is
+    nested: an OUTER scan over the n_rec = ceil(n_simsteps / record_every) blocks
+    emits exactly one strided sample (the block's start-of-step snapshot), and an
+    INNER scan advances `record_every` steps emitting nothing. So the recorded
+    buffer is (n_rec, n_cells, 3) -- record_every-times smaller -- and --record-every
+    N behaves on the GPU exactly as it does on the CPU backends. The last block is
+    handled separately so the loop advances EXACTLY n_simsteps steps (and `final`
+    is exact) even when record_every does not divide n_simsteps.
+
     Returns (v_trace, final, n_simsteps):
-      * v_trace -- record=True: (n_rec, n_cells, 4), n_rec = ceil(n_simsteps /
-        record_every), columns (V_soma, V_axon, V_dend, t), for validation.
-        record=False: an empty (0,0,0) array (throughput path, near-zero DtoH).
+      * v_trace -- record=True: (n_rec, n_cells, 4), columns (V_soma, V_axon,
+        V_dend, t). record=False: an empty (0,0,0) array (throughput path).
       * final   -- the IOState after the last step. Always real (it depends on the
-        whole scan), so callers can `block_until_ready(final)` for honest timing
+        whole loop), so callers can `block_until_ready(final)` for honest timing
         even when record=False and v_trace is empty; it is also the throughput
         result (Goal D: carry the final state, return nothing per step).
 
@@ -329,14 +341,38 @@ def simulate(state, g_CaL, neighbours,
     __main__ / the sweep driver), then this amortizes over long sims / repeats.
     """
     step = _make_step(g_CaL, neighbours, delta, sim_seconds,
-                      enable_gapjunctions, I_app, I_pulse10ms, use_knn, record)
-    xs = jnp.arange(n_simsteps)
-    final, ys = lax.scan(step, state, xs)
+                      enable_gapjunctions, I_app, I_pulse10ms, use_knn)
 
-    if record:
-        v_trace = _assemble_trace(ys, n_simsteps, delta, record_every)
-    else:
-        v_trace = jnp.empty((0, 0, 0), dtype=state.V_soma.dtype)
+    if not record:
+        # Throughput path: advance the whole sim emitting nothing per step. Only
+        # the final carry crosses PCIe back (near-zero DtoH -- Goal D).
+        final = _advance(step, state, 0, n_simsteps)
+        return jnp.empty((0, 0, 0), dtype=state.V_soma.dtype), final, n_simsteps
+
+    # Strided recording. n_full full record_every-length blocks + one tail block
+    # (tail in [1, record_every]); all three counts are static Python ints because
+    # n_simsteps and record_every are static.
+    n_rec = (n_simsteps + record_every - 1) // record_every
+    n_full = n_rec - 1          # full-length blocks
+    tail = n_simsteps - n_full * record_every       # steps left for the last block
+
+    def _snapshot(st):
+        return jnp.stack([st.V_soma, st.V_axon, st.V_dend], axis=-1)  # (n_cells, 3)
+
+    def outer_step(carry, block):
+        # Emit the block's start-of-step snapshot, then advance record_every steps.
+        sample = _snapshot(carry)
+        new_carry = _advance(step, carry, block * record_every, record_every)
+        return new_carry, sample
+
+    carry, samples_full = lax.scan(outer_step, state, jnp.arange(n_full))
+    # Last (possibly partial) block: record its start-of-step sample, advance the
+    # remaining `tail` steps so the total is exactly n_simsteps.
+    last_sample = _snapshot(carry)
+    final = _advance(step, carry, n_full * record_every, tail)
+
+    samples = jnp.concatenate([samples_full, last_sample[None]], axis=0)  # (n_rec, n_cells, 3)
+    v_trace = _attach_time(samples, delta, record_every)
     return v_trace, final, n_simsteps
 
 
