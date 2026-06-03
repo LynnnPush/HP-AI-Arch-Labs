@@ -279,17 +279,6 @@ def _make_step(g_CaL, neighbours, delta, sim_seconds,
     return step
 
 
-def _attach_time(samples, delta, record_every):
-    """Glue the time column onto an already-strided (n_rec, n_cells, 3) sample
-    stack -> the CPU-style (n_rec, n_cells, 4) trace (cols V_soma, V_axon, V_dend,
-    t). Sample j is the start-of-step snapshot at global step j*record_every, so
-    its time is j*record_every*delta (matches the CPU backends' time column)."""
-    n_rec, n_cells = samples.shape[0], samples.shape[1]
-    t_col = (jnp.arange(n_rec, dtype=samples.dtype) * record_every) * delta
-    t_col = jnp.broadcast_to(t_col[:, None, None], (n_rec, n_cells, 1))
-    return jnp.concatenate([samples, t_col], axis=-1)
-
-
 def _advance(step, carry, start_idx, length):
     """Advance `carry` exactly `length` steps with an inner lax.scan that emits
     NOTHING (ys=None) -- this is what keeps device memory bounded: no per-step
@@ -316,16 +305,26 @@ def simulate(state, g_CaL, neighbours,
     specializes the graph; delta/sim_seconds/I_* are traced so changing a current
     amplitude does NOT force a recompile.
 
-    Recording is STRIDED ON-DEVICE (the OOM fix). Rather than emitting one sample
-    per step into a (n_simsteps, n_cells, 3) buffer and slicing after -- which
-    materializes the full dense history and OOMs at large n_cells -- the loop is
-    nested: an OUTER scan over the n_rec = ceil(n_simsteps / record_every) blocks
-    emits exactly one strided sample (the block's start-of-step snapshot), and an
-    INNER scan advances `record_every` steps emitting nothing. So the recorded
-    buffer is (n_rec, n_cells, 3) -- record_every-times smaller -- and --record-every
-    N behaves on the GPU exactly as it does on the CPU backends. The last block is
-    handled separately so the loop advances EXACTLY n_simsteps steps (and `final`
-    is exact) even when record_every does not divide n_simsteps.
+    Recording is STRIDED ON-DEVICE in ONE uniform scan (the OOM fix). Rather than
+    emitting one sample per step into a (n_simsteps, n_cells, 3) buffer and slicing
+    after -- which materializes the full dense history and OOMs at large n_cells --
+    an OUTER scan over the n_rec = ceil(n_simsteps / record_every) blocks emits
+    exactly one strided sample per block (the block's start-of-step snapshot WITH
+    its time column already folded in -> (n_cells, 4)), and a per-block inner loop
+    advances that block's steps emitting nothing. So the ONLY trace buffer ever
+    materialized is the scan's own (n_rec, n_cells, 4) stack.
+
+    This is the residual-OOM fix at n_cells=100k under the sweep: the previous
+    version stacked a (n_rec, n_cells, 3) buffer, then concatenated a separate tail
+    block into a second copy, then _attach_time broadcast a (n_rec, n_cells, 1)
+    time column and concatenated AGAIN into the final (n_rec, n_cells, 4) -- three
+    full-size buffers live at once (~3x the trace, ~15 GiB at f64), which is what
+    blew past device memory even though each individual buffer fit. Peak is now ~1x
+    the trace. The last block can be shorter than record_every (when it does not
+    divide n_simsteps), so its length is a tracer and the inner advance is a
+    dynamic-trip lax.fori_loop -- this keeps the whole recorder in ONE outer scan
+    (no concatenated tail) while still advancing EXACTLY n_simsteps steps, so
+    `final` stays exact.
 
     Returns (v_trace, final, n_simsteps):
       * v_trace -- record=True: (n_rec, n_cells, 4), columns (V_soma, V_axon,
@@ -356,23 +355,31 @@ def simulate(state, g_CaL, neighbours,
     n_full = n_rec - 1          # full-length blocks
     tail = n_simsteps - n_full * record_every       # steps left for the last block
 
-    def _snapshot(st):
-        return jnp.stack([st.V_soma, st.V_axon, st.V_dend], axis=-1)  # (n_cells, 3)
-
     def outer_step(carry, block):
-        # Emit the block's start-of-step snapshot, then advance record_every steps.
-        sample = _snapshot(carry)
-        new_carry = _advance(step, carry, block * record_every, record_every)
+        # Start-of-step snapshot with the time column folded straight in: every
+        # cell in this block shares t = block*record_every*delta, so build the
+        # (n_cells, 4) row here instead of stacking 3 cols and concatenating a
+        # broadcast time column afterwards (that post-hoc concat was a second
+        # full-size copy of the whole trace -- part of the OOM).
+        t = ((block * record_every) * delta).astype(carry.V_soma.dtype)
+        t_col = jnp.broadcast_to(t, carry.V_soma.shape)             # (n_cells,)
+        sample = jnp.stack([carry.V_soma, carry.V_axon, carry.V_dend, t_col],
+                           axis=-1)                                 # (n_cells, 4)
+        # Advance this block: record_every steps for every full block, `tail` for
+        # the last one, so the loop covers EXACTLY n_simsteps steps and `final`
+        # stays exact. The length is a tracer (it differs on the last block when
+        # record_every does not divide n_simsteps), so the inner advance is a
+        # dynamic-trip fori_loop rather than a static lax.scan -- which lets the
+        # whole recorder stay in this ONE outer scan (no separate concatenated
+        # tail block, hence one trace buffer instead of two).
+        length = jnp.where(block == n_full, tail, record_every)
+        start = block * record_every
+        new_carry = lax.fori_loop(0, length, lambda k, c: step(c, start + k), carry)
         return new_carry, sample
 
-    carry, samples_full = lax.scan(outer_step, state, jnp.arange(n_full))
-    # Last (possibly partial) block: record its start-of-step sample, advance the
-    # remaining `tail` steps so the total is exactly n_simsteps.
-    last_sample = _snapshot(carry)
-    final = _advance(step, carry, n_full * record_every, tail)
-
-    samples = jnp.concatenate([samples_full, last_sample[None]], axis=0)  # (n_rec, n_cells, 3)
-    v_trace = _attach_time(samples, delta, record_every)
+    # One scan -> the sole (n_rec, n_cells, 4) device buffer; `final` is the carry
+    # after the last block, i.e. exactly n_simsteps steps in.
+    final, v_trace = lax.scan(outer_step, state, jnp.arange(n_rec))
     return v_trace, final, n_simsteps
 
 
