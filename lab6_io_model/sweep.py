@@ -42,6 +42,13 @@ from datetime import datetime
 
 import numpy as np
 
+# Absolute (lab6_io_model.*) imports require the repo root on sys.path. Add it so
+# this script works whether launched as `python3 -m lab6_io_model.sweep` from the
+# repo root or as `python3 sweep.py` from inside the lab6_io_model/ directory.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 # Import the model under test. Importing only defines the functions / default
 # globals; the simulation in its __main__ block does NOT run on import.
 import lab6_io_model.cpu.io_model as io_model
