@@ -1,0 +1,69 @@
+==PROF== Connected to process 22047 (/usr/bin/python3.12)
+==PROF== Profiling "loop_broadcast_fusion": 0%
+==WARNING== Backing up device memory in system memory. Kernel replay might be slow. Consider using "--replay-mode application" to avoid memory save-and-restore.
+
+==WARNING== Backing up device memory in system memory. Kernel replay might be slow. Consider using "--replay-mode application" to avoid memory save-and-restore.
+....50%....100% - 6 passes
+==PROF== Profiling "loop_multiply_fusion": 0%....50%....100% - 6 passes
+==PROF== Profiling "loop_dynamic_update_slice_fusion": 0%....50%....100% - 6 passes
+==PROF== Profiling "input_reduce_fusion": 0%....50%....100% - 6 passes
+==PROF== Profiling "loop_add_fusion": 0%....50%....100% - 6 passes
+n_cells=1000 n_simsteps=200 dtype=float64 knn=True record_every=40 repeats=1
+wall/sim=26.976 ms  throughput=7.41 Mcell-steps/s
+==PROF== Disconnected from process 22047
+[22047] python3.12@127.0.0.1
+  loop_broadcast_fusion (157, 1, 1)x(128, 1, 1), Context 1, Stream 13, Device 0, CC 7.5
+    Section: Command line profiler metrics
+    -------------------------------------------------- ------------ ------------
+    Metric Name                                         Metric Unit Metric Value
+    -------------------------------------------------- ------------ ------------
+    dram__bytes.sum.per_second                         Mbyte/second       992.19
+    dram__throughput.avg.pct_of_peak_sustained_elapsed            %         0.38
+    sm__throughput.avg.pct_of_peak_sustained_elapsed              %         3.22
+    sm__warps_active.avg.pct_of_peak_sustained_active             %        43.05
+    -------------------------------------------------- ------------ ------------
+
+  loop_multiply_fusion (1, 1, 1)x(1, 1, 1), Context 1, Stream 13, Device 0, CC 7.5
+    Section: Command line profiler metrics
+    -------------------------------------------------- ------------ ------------
+    Metric Name                                         Metric Unit Metric Value
+    -------------------------------------------------- ------------ ------------
+    dram__bytes.sum.per_second                         Mbyte/second       803.92
+    dram__throughput.avg.pct_of_peak_sustained_elapsed            %         0.31
+    sm__throughput.avg.pct_of_peak_sustained_elapsed              %         0.01
+    sm__warps_active.avg.pct_of_peak_sustained_active             %         3.09
+    -------------------------------------------------- ------------ ------------
+
+  loop_dynamic_update_slice_fusion (32, 1, 1)x(128, 1, 1), Context 1, Stream 13, Device 0, CC 7.5
+    Section: Command line profiler metrics
+    -------------------------------------------------- ------------ ------------
+    Metric Name                                         Metric Unit Metric Value
+    -------------------------------------------------- ------------ ------------
+    dram__bytes.sum.per_second                         Gbyte/second         7.18
+    dram__throughput.avg.pct_of_peak_sustained_elapsed            %         2.45
+    sm__throughput.avg.pct_of_peak_sustained_elapsed              %         3.67
+    sm__warps_active.avg.pct_of_peak_sustained_active             %        12.13
+    -------------------------------------------------- ------------ ------------
+
+  input_reduce_fusion (32, 1, 1)x(256, 1, 1), Context 1, Stream 13, Device 0, CC 7.5
+    Section: Command line profiler metrics
+    -------------------------------------------------- ------------ ------------
+    Metric Name                                         Metric Unit Metric Value
+    -------------------------------------------------- ------------ ------------
+    dram__bytes.sum.per_second                         Gbyte/second         8.69
+    dram__throughput.avg.pct_of_peak_sustained_elapsed            %         2.90
+    sm__throughput.avg.pct_of_peak_sustained_elapsed              %         9.58
+    sm__warps_active.avg.pct_of_peak_sustained_active             %        23.06
+    -------------------------------------------------- ------------ ------------
+
+  loop_add_fusion (8, 1, 1)x(128, 1, 1), Context 1, Stream 13, Device 0, CC 7.5
+    Section: Command line profiler metrics
+    -------------------------------------------------- ------------ ------------
+    Metric Name                                         Metric Unit Metric Value
+    -------------------------------------------------- ------------ ------------
+    dram__bytes.sum.per_second                         Gbyte/second         2.19
+    dram__throughput.avg.pct_of_peak_sustained_elapsed            %         0.70
+    sm__throughput.avg.pct_of_peak_sustained_elapsed              %        16.26
+    sm__warps_active.avg.pct_of_peak_sustained_active             %        12.47
+    -------------------------------------------------- ------------ ------------
+

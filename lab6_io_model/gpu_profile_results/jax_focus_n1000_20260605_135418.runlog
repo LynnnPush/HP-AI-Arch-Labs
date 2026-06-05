@@ -1,0 +1,14 @@
+WARNING: CPU IP/backtrace sampling not supported, disabling.
+Try the 'nsys status --environment' command to learn more.
+
+WARNING: CPU context switch tracing not supported, disabling.
+Try the 'nsys status --environment' command to learn more.
+
+n_cells=1000 n_simsteps=4000 dtype=float64 knn=True record_every=40 repeats=2
+wall/sim=169.036 ms  throughput=23.66 Mcell-steps/s
+Importer error status: The importer binary and its dependencies were not found.
+Unable to retrieve the importer version: skipping importation of the QDSTRM file.
+GPU 0: General Metrics for NVIDIA TU10x (any frequency)
+Generating '/tmp/nsys-report-727b.qdstrm'
+Generated:
+    /home/ubuntu/HP-AI-Arch-Labs/lab6_io_model/gpu_profile_results/jax_focus_n1000_20260605_135418.qdstrm

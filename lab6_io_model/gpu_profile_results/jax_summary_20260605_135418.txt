@@ -1,0 +1,5 @@
+n_cells   Mcellsteps/s  cuLaunchKernel  kernel_execs  kernels/step 
+10        0.35          33594           33593         3.00         
+100       2.34          33594           33593         3.00         
+1000      23.40         33600           33599         3.00         
+10000     134.53        33600           33600         3.00         

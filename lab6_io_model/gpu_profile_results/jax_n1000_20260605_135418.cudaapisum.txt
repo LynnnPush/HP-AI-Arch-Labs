@@ -1,0 +1,43 @@
+Processing [/home/ubuntu/HP-AI-Arch-Labs/lab6_io_model/gpu_profile_results/jax_n1000_20260605_135418.sqlite] with [/usr/lib/x86_64-linux-gnu/nsight-systems/target-linux-x64/reports/cudaapisum.py]... 
+
+ ** CUDA API Summary (cudaapisum):
+
+ Time (%)  Total Time (ns)  Num Calls  Avg (ns)   Med (ns)   Min (ns)  Max (ns)  StdDev (ns)                Name               
+ --------  ---------------  ---------  ---------  ---------  --------  --------  -----------  ---------------------------------
+     95.2        440405235      33600    13107.3     4089.0      3187     98046      17523.0  cuLaunchKernel                   
+      1.6          7245547          1  7245547.0  7245547.0   7245547   7245547          0.0  cuMemFree_v2                     
+      0.6          2762543          2  1381271.5  1381271.5   1380633   1381910        903.0  cudaGetDeviceProperties_v2_v12000
+      0.5          2296809          3   765603.0    22961.0      5354   2268494    1301571.6  cuMemFreeHost                    
+      0.5          2090980        276     7576.0     6839.5      5473     34462       2767.5  cuMemcpyDtoDAsync_v2             
+      0.3          1193000          1  1193000.0  1193000.0   1193000   1193000          0.0  cuMemHostAlloc                   
+      0.2          1093478          2   546739.0   546739.0      7419   1086059     762713.7  cudaHostAlloc                    
+      0.2           856124         59    14510.6     8625.0      2541    201538      26846.1  cuLaunchHostFunc                 
+      0.1           570027          1   570027.0   570027.0    570027    570027          0.0  cuMemAlloc_v2                    
+      0.1           490058         17    28826.9     3393.0      2092    368556      87961.6  cuStreamCreate                   
+      0.1           466975         28    16677.7    10590.5      6399     38304      10629.5  cuMemcpyHtoDAsync_v2             
+      0.1           427526         32    13360.2     2663.5      2156    143108      34130.1  cudaStreamCreateWithFlags        
+      0.1           399123          1   399123.0   399123.0    399123    399123          0.0  cuModuleUnload                   
+      0.1           327320          1   327320.0   327320.0    327320    327320          0.0  cuModuleLoadFatBinary            
+      0.1           253183        118     2145.6     1069.5       415     27880       4138.7  cuEventRecord                    
+      0.1           232816        838      277.8      214.0       147     19552        681.3  cuGetProcAddress_v2              
+      0.0           212191          8    26523.9     3873.0      2873    179309      61792.8  cuStreamCreateWithPriority       
+      0.0           180829          1   180829.0   180829.0    180829    180829          0.0  cuGraphExecDestroy               
+      0.0           175111        115     1522.7     1087.0       456     16047       2026.5  cuStreamWaitEvent                
+      0.0           168949        450      375.4      231.0       143      3790        433.5  cuCtxSetCurrent                  
+      0.0           108676          4    27169.0     8196.0      6822     85462      38872.3  cudaMalloc                       
+      0.0            92556          3    30852.0    29220.0      9603     53733      22110.2  cuMemGetInfo_v2                  
+      0.0            90156        276      326.7      306.0       221       711         73.5  cuStreamIsCapturing              
+      0.0            79129         20     3956.5     3270.5      2687     12107       2074.5  cuStreamDestroy_v2               
+      0.0            77376         48     1612.0      899.5       320     25549       3656.4  cuEventCreate                    
+      0.0            71398          2    35699.0    35699.0     34970     36428       1031.0  cuGraphLaunch                    
+      0.0            69592          4    17398.0    13840.5      4061     37850      16034.4  cudaMemsetAsync                  
+      0.0            40005         27     1481.7      965.0       618     11813       2142.1  cuStreamSynchronize              
+      0.0            27478         43      639.0      558.0       266      1495        333.6  cuEventDestroy_v2                
+      0.0            20942          2    10471.0    10471.0      1814     19128      12242.8  cudaFree                         
+      0.0            11259          1    11259.0    11259.0     11259     11259          0.0  cuCtxSynchronize                 
+      0.0            10213          1    10213.0    10213.0     10213     10213          0.0  cuGraphDestroy                   
+      0.0             9214          3     3071.3     2454.0      2186      4574       1308.2  cuInit                           
+      0.0             5435          1     5435.0     5435.0      5435      5435          0.0  cuGraphCreate                    
+      0.0             2966          2     1483.0     1483.0      1440      1526         60.8  cudaEventCreateWithFlags         
+      0.0              384          2      192.0      192.0       174       210         25.5  cuModuleGetLoadingMode           
+

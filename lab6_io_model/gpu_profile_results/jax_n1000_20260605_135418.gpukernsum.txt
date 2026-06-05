@@ -1,0 +1,13 @@
+Generating SQLite file /home/ubuntu/HP-AI-Arch-Labs/lab6_io_model/gpu_profile_results/jax_n1000_20260605_135418.sqlite from /home/ubuntu/HP-AI-Arch-Labs/lab6_io_model/gpu_profile_results/jax_n1000_20260605_135418.nsys-rep
+Processing [/home/ubuntu/HP-AI-Arch-Labs/lab6_io_model/gpu_profile_results/jax_n1000_20260605_135418.sqlite] with [/usr/lib/x86_64-linux-gnu/nsight-systems/target-linux-x64/reports/gpukernsum.py]... 
+
+ ** CUDA GPU Kernel Summary (gpukernsum):
+
+ Time (%)  Total Time (ns)  Instances  Avg (ns)  Med (ns)  Min (ns)  Max (ns)  StdDev (ns)     GridXYZ         BlockXYZ                   Name              
+ --------  ---------------  ---------  --------  --------  --------  --------  -----------  --------------  --------------  --------------------------------
+     87.9        436956098      10926   39992.3   34175.0     33727     90751      13797.4     8    1    1   128    1    1  loop_add_fusion                 
+      6.9         34071193      10926    3118.4    2816.0      2688      5920        676.5    32    1    1   256    1    1  input_reduce_fusion             
+      5.0         24605612      11201    2196.7    1984.0      1888      4128        455.9     1    1    1     1    1    1  loop_add_fusion_1               
+      0.1           720475        273    2639.1    2368.0      2304      4928        590.9    32    1    1   128    1    1  loop_dynamic_update_slice_fusion
+      0.1           657725        273    2409.2    2176.0      2080      4256        519.4     1    1    1     1    1    1  loop_multiply_fusion            
+

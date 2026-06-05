@@ -1,0 +1,13 @@
+WARNING: CPU IP/backtrace sampling not supported, disabling.
+Try the 'nsys status --environment' command to learn more.
+
+WARNING: CPU context switch tracing not supported, disabling.
+Try the 'nsys status --environment' command to learn more.
+
+n_cells=10 n_simsteps=4000 dtype=float64 knn=True record_every=40 repeats=2
+wall/sim=115.419 ms  throughput=0.35 Mcell-steps/s
+Importer error status: The importer binary and its dependencies were not found.
+Unable to retrieve the importer version: skipping importation of the QDSTRM file.
+Generating '/tmp/nsys-report-c8a4.qdstrm'
+Generated:
+    /home/ubuntu/HP-AI-Arch-Labs/lab6_io_model/gpu_profile_results/jax_n10_20260605_135418.qdstrm
