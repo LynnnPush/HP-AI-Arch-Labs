@@ -28,6 +28,7 @@ The single-file backends are split by hardware target: the CPU ones live under
 | `validate.py` | Runs the baseline + chosen backends from one seeded state; reports speedup, divergence-vs-baseline, and machine-epsilon equality among the optimized backends. The multiprocessing schemes (`mp`, `mp_intra`) and the GPU backend (`jax`) are selectable too — a pure numeric check that each reproduces the `jit` numerics. |
 | `sweep.py` | Parameter-sweep / performance harness for **any backend** (`--backend baseline\|vec\|jit\|vec_jit\|mp_intra\|jax_gpu`): wall/CPU time, throughput, latency, real-time factor. Catches unstable configs and records them rather than aborting. Supports local kNN gap-junction coupling on the jit/jax_gpu backends (`--knn`, **default on**). |
 | `profile_io.py` | `cProfile` breakdown of the baseline (per-compartment cost, gap-junction on/off, scaling with N). |
+| `spikes.py` | **Spike-based numerical-quality** analysis (Goal C). Detects soma spikes per cell and compares backends with a rate-level metric that survives the model's chaotic L2 divergence: spike count / firing rate / ISI (should be ~exact). Also plots spike rasters and a V_soma+spikes overlay (which carry the timing structure) and saves the raw spike trains as CSV. Reuses `validate.py`'s seed-matched traces. |
 | `cpu/mp_sims.py` | Multiprocessing across **independent** sims, using the `jit` backend as the per-sim backbone. |
 | `cpu/mp_sims_intra.py` | Multiprocessing **within one** sim: splits the cells of a single sim across processes (domain decomposition). State lives in shared memory; the only per-step IPC is the global gap-junction sum (`Sd`) all-reduce + a barrier. |
 | `sweep_results/` | CSV/JSON output from `sweep.py`. |
@@ -149,6 +150,82 @@ runs one sim through the across-sims pipeline (a `ProcessPoolExecutor` worker), 
 it reproduces `jit` **bit-for-bit**. `mp_intra` splits the sim's cells across
 processes and sums the global `Sd` as a sum of per-worker partials, so it agrees
 with `jit` to **machine epsilon** (the equality cross-check) rather than exactly.
+
+### Spike-based numerical quality (beyond divergence)
+
+> **The chaos caveat.** The IO network is *chaotic*: the pointwise V-trace L2
+> error between two equally correct backends grows **exponentially** from
+> floating-point rounding alone. So a rising `allclose`/L2 residual between, say,
+> the CPU `jit` and the GPU `jax_gpu` backend is **expected** — it is Lyapunov
+> amplification of ulp-level differences, **not** by itself a bug. `validate.py`
+> measures that divergence; `spikes.py` instead uses metrics that stay stable
+> after the raw traces have decorrelated.
+
+`spikes.py` detects soma spikes per cell and compares a backend against a
+reference with a **rate-level** metric (coarse, should be ~exact): total spike
+**count** and mean firing **rate** per cell (plus mean **ISI**, the rhythm
+period), reported as a relative error vs the reference. For functionally identical
+math this is ~0 *even when the V-trace L2 has blown up*; a divergence **here** is a
+real bug, unlike a rising L2. (Spike-*timing* structure — whether the trains line
+up, not just how many — is conveyed by the two figures rather than a scalar
+spike-distance, which would add a free parameter to justify.)
+
+All traces come from `validate.py`'s seed-matched `run_*_trace`, so every backend
+starts from the identical `sweep.build_initial_state(seed)`. The default pairing
+is **`jit` (reference) vs `jax`** because `validate` forces *both* onto **f64 +
+all-to-all** coupling (`run_jax_trace` sets f64/`use_knn=False`; `run_jit_trace`
+defaults to all-to-all) — an apples-to-apples comparison. **Do not** compare an
+f32/kNN run against an f64/all-to-all one.
+
+**Spike detection (the IO-specific catch).** The soma carries a subthreshold
+oscillation (STO); its crests must **not** be counted as spikes.
+`scipy.signal.find_peaks` runs on raw column 0 (`V_soma`) with a `height`
+threshold placed **above** the STO crest band (`--v-th`, default −45 mV), or a
+`--prominence` criterion instead, plus a `--refractory-ms` window so one broad
+depolarization yields a single spike. Choose the threshold from data with
+`--inspect`, which prints a pooled peak-height histogram — put `--v-th` in the gap
+between the dense STO band and the sparse spike tail.
+
+```bash
+py -3 spikes.py --inspect                       # peak-height histogram -> pick --v-th
+py -3 spikes.py                                  # jit (ref) vs jax, default 1.0 s
+py -3 spikes.py --backends baseline jit --reference jit   # CPU-only check (no GPU)
+py -3 spikes.py --v-th -44 --refractory-ms 5      # tune detection
+py -3 spikes.py --save                           # write figures to spike_results/ (headless)
+py -3 spikes.py --backends baseline jit --reference baseline --knn   # jit kNN vs all-to-all baseline
+```
+
+Flags: `--backends`, `--reference`, `--sim-seconds`, `--n-cells`, `--delta`,
+`--seed`, `--v-th`, `--prominence`, `--refractory-ms`, `--knn`/`--k`,
+`--inspect`, `--cell`, `--save`, `--outdir`. It prints the chaos
+caveat, a per-backend rate summary, and the backend-vs-reference comparison, then
+plots two figures: a **spike raster** (one panel per backend) and a **V_soma +
+detected spikes** overlay for the reference's most-active cell (`--cell` to
+override). `--save` writes the two PNGs **plus a `spikes_<stamp>.csv`** (the raw
+detected spike trains, tidy long format: `backend, cell, spike_index,
+spike_time_ms` — one row per spike) to `spike_results/` instead of opening windows,
+so the analysis is reproducible without re-running the sims. For identical Jacobi
+numerics (e.g. `jit` vs `vec`/`vec_jit`/f64-`jax`) the count rel-error is ~0; the
+Gauss-Seidel `baseline` drifts a little in count (a different, equally valid
+scheme), not a bug.
+
+**`--knn` / `--k K` (default off; `jit` only).** Run the `jit` backend with local
+k-nearest-neighbour gap coupling (the sweep/production default) instead of
+all-to-all. **Caveat:** the baseline is all-to-all only and `validate`'s
+`run_jax_trace` forces all-to-all, so a kNN `jit` differs from either reference in
+**two** ways at once — the Jacobi-vs-Gauss-Seidel scheme *and* a different
+gap-junction topology (each cell couples to `K` neighbours, not all N). The
+resulting spike divergence is therefore **expected from the physics**, not a bug;
+the per-cell mean ISI stays put (intrinsic rhythm preserved) while network-coupled
+recruitment shifts. For a clean numerics-only check, compare like-for-like
+coupling (all-to-all `jit` vs `baseline`, or kNN vs kNN). When `--knn` is set the
+flag is ignored for non-`jit` backends (a one-line note is printed for `jax`), and
+saved filenames gain a `_knn{K}` suffix.
+
+```bash
+py -3 spikes.py --backends baseline jit --reference baseline --knn       # jit kNN vs baseline
+py -3 spikes.py --backends baseline jit --reference baseline --knn --k 16 # denser local coupling
+```
 
 ### Multiprocessing across independent sims
 
@@ -360,7 +437,8 @@ coupling every value is stable, while `--no-knn` flags the 5000-cell point
 1. Profile the baseline (`profile_io.py`) to see where the time goes.
 2. Validate the optimized backends against the baseline (`validate.py`) — confirm
    speedup, bounded divergence, and machine-epsilon agreement (include `jax` to
-   check the GPU port in f64).
+   check the GPU port in f64). For chaotic configs where the L2 has blown up, fall
+   back to `spikes.py` for the spike-count / firing-rate check that still holds.
 3. Pick `jit` as the single-sim CPU backbone and scale out with `mp_sims.py`.
 4. For the GPU, decide the precision fork (`--jax-x64` f64 vs default f32) from the
    measured trace drift, then batch many networks (`vmap`, Goal C) for the
