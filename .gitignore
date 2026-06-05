@@ -1,2 +1,7 @@
 __pycache__/
 *.py[cod]
+
+# gpu profile visual binary files:
+lab6_io_model/gpu_profile_results/*.nsys-rep
+lab6_io_model/gpu_profile_results/*.qdstrm
+lab6_io_model/gpu_profile_results/*.sqlite
