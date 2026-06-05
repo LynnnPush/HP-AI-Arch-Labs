@@ -435,7 +435,11 @@ def main():
 
     if args.save:
         os.makedirs(args.outdir, exist_ok=True)
-        stamp = f"N{args.n_cells}_{args.sim_seconds}s_seed{args.seed}"
+        # Encode the experiment SET (reference + the backends compared against it)
+        # so distinct comparisons -- e.g. `jit vs jax` and `jit vs baseline` -- don't
+        # overwrite each other. `others` (non-reference backends) is built above.
+        expt = "_".join([f"ref-{args.reference}", *others])
+        stamp = f"{expt}_N{args.n_cells}_{args.sim_seconds}s_seed{args.seed}"
         if args.knn:
             stamp += f"_knn{args.k}"
         raster_path = os.path.join(args.outdir, f"raster_{stamp}.png")
