@@ -11,7 +11,6 @@
 #      / DRAM BW timeline) at one n_cells; open the .nsys-rep in nsys-ui.
 #   3. ncu                       -> per-kernel achieved occupancy + bandwidth
 #      (needs sudo; XLA command buffers disabled; launch-count limited).
-#   4. nvidia-smi dmon           -> coarse sm%/mem% timeline during a long sim.
 #
 # Usage:
 #   bash lab6_io_model/run_jax_gpu_profile.sh            # full default run
@@ -23,10 +22,11 @@
 #                (matches sweep.py's canonical n_cells range)
 #   N_SIMSTEPS   [4000]   scan trip count for the sweep
 #   REPEATS      [3]      timed instances per run
-#   FOCUS_NCELLS [1000]   n_cells for the detailed nsys / ncu / dmon steps
+#   FOCUS_NCELLS [1000]   n_cells for the detailed nsys / ncu steps
 #   NCU_NSIMSTEPS[200]    short run for ncu (it replays each kernel ~6x)
-#   DMON_NSIMSTEPS[200000] long run so dmon samples something
-#   RUN_NSYS/RUN_NCU/RUN_DMON [1]   toggle individual steps
+#   IO_X64       [1]      float64 (matches the sweep); 0 -> f32 fast path
+#   IO_RECORD_EVERY [40]  strided-recording stride (matches the sweep)
+#   RUN_NSYS/RUN_NCU [1]   toggle individual steps
 #   SMOKE        [unset]  shrink everything for a quick pipeline self-test
 set -uo pipefail
 
@@ -41,15 +41,18 @@ mkdir -p "$OUT"
 if [ "${SMOKE:-0}" = "1" ]; then
   NCELLS_SWEEP="${NCELLS_SWEEP:-2 100}"; N_SIMSTEPS="${N_SIMSTEPS:-400}"
   REPEATS="${REPEATS:-2}"; FOCUS_NCELLS="${FOCUS_NCELLS:-100}"
-  NCU_NSIMSTEPS="${NCU_NSIMSTEPS:-40}"; DMON_NSIMSTEPS="${DMON_NSIMSTEPS:-4000}"
+  NCU_NSIMSTEPS="${NCU_NSIMSTEPS:-40}"
 else
-  # canonical n_cells range from sweep.py (PARAM_SPECS["n_cells"]["values"]).
-  NCELLS_SWEEP="${NCELLS_SWEEP:-1 2 10 30 100 1000 10000 100000}"
-  N_SIMSTEPS="${N_SIMSTEPS:-4000}"; REPEATS="${REPEATS:-3}"
+  # Only sweep representative size of each range.
+  NCELLS_SWEEP="${NCELLS_SWEEP:-10 100 1000 10000}"
+  N_SIMSTEPS="${N_SIMSTEPS:-4000}"; REPEATS="${REPEATS:-2}"
   FOCUS_NCELLS="${FOCUS_NCELLS:-1000}"; NCU_NSIMSTEPS="${NCU_NSIMSTEPS:-200}"
-  DMON_NSIMSTEPS="${DMON_NSIMSTEPS:-200000}"
 fi
-RUN_NSYS="${RUN_NSYS:-1}"; RUN_NCU="${RUN_NCU:-1}"; RUN_DMON="${RUN_DMON:-1}"
+RUN_NSYS="${RUN_NSYS:-1}"; RUN_NCU="${RUN_NCU:-1}"
+# Match the sweep.py jax_gpu config so the profile explains the swept curve:
+# float64 + strided recording (record_every=40). Exported so every step's child
+# python inherits them (the ncu step also passes them explicitly through sudo).
+export IO_X64="${IO_X64:-1}" IO_RECORD_EVERY="${IO_RECORD_EVERY:-40}"
 
 # ---- preflight: the GPU must be up (it has died on kernel-reboots before) ----
 if ! nvidia-smi -L >/dev/null 2>&1; then
@@ -66,6 +69,7 @@ fi
 echo "=================================================================="
 echo "jax_gpu profile  stamp=$STAMP  focus_n=$FOCUS_NCELLS"
 echo "  sweep=[$NCELLS_SWEEP]  n_simsteps=$N_SIMSTEPS  repeats=$REPEATS"
+echo "  dtype=$([ "$IO_X64" = 1 ] && echo float64 || echo float32)  record_every=$IO_RECORD_EVERY  (matching the sweep)"
 echo "=================================================================="
 
 # nsys auto-import is broken on this host; convert the .qdstrm by hand.
@@ -113,31 +117,21 @@ if [ "$RUN_NCU" = "1" ]; then
   base="$OUT/jax_ncu_n${FOCUS_NCELLS}_${STAMP}"
   echo "-- ncu (sudo; command buffers off; 3 body kernels) at n_cells=$FOCUS_NCELLS --"
   # ncu needs root; sudo resets env, so pass PATH/HOME/IO_*/XLA_FLAGS explicitly.
-  # --kernel-name regex:fusion targets the 3 per-step body kernels (skips the
+  # --kernel-name regex:fusion targets the per-step body kernels (skips the
   # one-off wrapped_iota/broadcast setup); no -o so the metric table prints to
-  # stdout (add -o "$base" for a GUI .ncu-rep as well).
+  # stdout (add -o "$base" for a GUI .ncu-rep as well). -c 5 (not 3) because
+  # record_every>0 interleaves a recording fusion, so grab a couple extra to be
+  # sure all 3 body kernels are captured.
   sudo -E env PATH="$PATH" HOME="$HOME" \
        IO_N_CELLS="$FOCUS_NCELLS" IO_N_SIMSTEPS="$NCU_NSIMSTEPS" IO_REPEATS=1 \
+       IO_X64="$IO_X64" IO_RECORD_EVERY="$IO_RECORD_EVERY" \
        XLA_FLAGS="--xla_gpu_enable_command_buffer=" \
-    ncu --kernel-name "regex:fusion" -c 3 --target-processes all \
+    ncu --kernel-name "regex:fusion" -c 5 --target-processes all \
        --metrics sm__warps_active.avg.pct_of_peak_sustained_active,sm__throughput.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed,dram__bytes.sum.per_second \
        python3 "$DRIVER" >"$base.txt" 2>&1
   grep -iE ", Device [0-9]|sm__warps_active|sm__throughput|dram__throughput|dram__bytes" "$base.txt" \
     | sed 's/^/   /' || true
   echo "   full ncu output: $base.txt"
-fi
-
-# ====================== 4. nvidia-smi dmon coarse timeline =====================
-if [ "$RUN_DMON" = "1" ]; then
-  dmon_csv="$OUT/jax_dmon_${STAMP}.csv"
-  echo "-- nvidia-smi dmon (sm%/mem% timeline) during a long sim at n_cells=$FOCUS_NCELLS --"
-  nvidia-smi dmon -s um -o DT -f "$dmon_csv" &
-  DMON_PID=$!
-  trap '[ -n "${DMON_PID:-}" ] && kill "$DMON_PID" 2>/dev/null' EXIT
-  IO_N_CELLS="$FOCUS_NCELLS" IO_N_SIMSTEPS="$DMON_NSIMSTEPS" IO_REPEATS=3 \
-    python3 "$DRIVER" >"$OUT/jax_dmon_${STAMP}.runlog" 2>&1
-  kill "$DMON_PID" 2>/dev/null; trap - EXIT; DMON_PID=""
-  echo "   dmon csv: $dmon_csv"
 fi
 
 echo "=================================================================="
