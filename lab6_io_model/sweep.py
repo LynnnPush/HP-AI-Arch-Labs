@@ -433,6 +433,9 @@ def make_config(param, value):
 
 # Column order for the CSV / printed table.
 CONFIG_KEYS = ["sim_seconds", "delta", "n_cells", "enable_gapjunctions", "I_pulse10ms", "g_CaL"]
+# A single self-describing coupling column: "knn<k>" when local kNN coupling is
+# in effect (it only takes effect on a backend in _KNN_BACKENDS), else "all-to-all".
+COUPLING_KEYS = ["coupling"]
 METRIC_KEYS = [
     "n_simsteps", "total_cell_steps", "wall_time_s", "cpu_time_s",
     "throughput_steps_per_s", "throughput_cellsteps_per_s",
@@ -443,7 +446,7 @@ METRIC_KEYS = [
 
 def print_table(rows):
     """Pretty-print a compact summary table to stdout."""
-    cols = ["swept_param", "swept_value", "n_cells", "delta", "sim_seconds",
+    cols = ["swept_param", "swept_value", "n_cells", "coupling", "delta", "sim_seconds",
             "wall_time_s", "throughput_cellsteps_per_s", "latency_us_per_step",
             "realtime_factor", "status"]
     widths = {c: len(c) for c in cols}
@@ -571,8 +574,9 @@ def main():
     rows = []
     workers_note = (f", workers={args.workers or os.cpu_count()}"
                     if args.backend == "mp_intra" else "")
-    coupling_note = (f"knn(k={args.k})" if (args.knn and args.backend in _KNN_BACKENDS)
-                     else "all-to-all")
+    effective_knn = args.knn and args.backend in _KNN_BACKENDS
+    coupling = f"knn{args.k}" if effective_knn else "all-to-all"
+    coupling_note = f"knn(k={args.k})" if effective_knn else "all-to-all"
     print(f"Sweeping: {', '.join(selected)}  "
           f"(backend={args.backend}, coupling={coupling_note}, repeats={args.repeats}, "
           f"seed={seed}, record_every={args.record_every}{workers_note})\n")
@@ -583,6 +587,7 @@ def main():
 
             row = {"swept_param": param, "swept_value": value}
             row.update({k: cfg[k] for k in CONFIG_KEYS})
+            row["coupling"] = coupling
 
             # A config can blow up (e.g. the explicit-Euler IO model goes stiff
             # at large n_cells with gap junctions on -> non-finite V -> a gating
@@ -614,9 +619,11 @@ def main():
     os.makedirs(args.outdir, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     tag = "all" if set(selected) == set(PARAM_SPECS) else "_".join(selected)
-    base = os.path.join(args.outdir, f"sweep_{args.backend}_{tag}_{stamp}")
+    coupling_tag = coupling if effective_knn else "noknn"
+    base = os.path.join(args.outdir, f"sweep_{args.backend}_{tag}_{coupling_tag}_{stamp}")
 
-    fieldnames = ["swept_param", "swept_value"] + CONFIG_KEYS + METRIC_KEYS + ["status"]
+    fieldnames = (["swept_param", "swept_value"] + CONFIG_KEYS + COUPLING_KEYS
+                  + METRIC_KEYS + ["status"])
     csv_path = base + ".csv"
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
