@@ -123,7 +123,7 @@ PARAM_SPECS = {
         "help": "Time-step duration in seconds.",
     },
     "n_cells": {
-        "values": [1, 2, 10, 30, 100, 1000, 10000, 100000],
+        "values": [1, 2, 10, 30],
         "overrides": {},
         "help": "Cell population size. Values >~4000 go unstable with all-to-all "
                 "gap junctions (--no-knn) but stay stable under local --knn coupling. "

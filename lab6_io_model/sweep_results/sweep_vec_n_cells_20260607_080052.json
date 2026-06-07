@@ -1,0 +1,226 @@
+{
+  "timestamp": "20260607_080052",
+  "backend": "vec",
+  "record_every": 40,
+  "knn": false,
+  "k": 8,
+  "jax_dtype": null,
+  "workers": null,
+  "swept_params": [
+    "n_cells"
+  ],
+  "repeats": 1,
+  "seed": 1981,
+  "baseline": {
+    "sim_seconds": 1.0,
+    "delta": 0.01,
+    "n_cells": 30,
+    "enable_gapjunctions": true,
+    "I_pulse10ms": 2.0,
+    "g_CaL": null
+  },
+  "param_specs": {
+    "sim_seconds": {
+      "values": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "overrides": {}
+    },
+    "delta": {
+      "values": [
+        0.01,
+        0.03,
+        0.05
+      ],
+      "overrides": {}
+    },
+    "n_cells": {
+      "values": [
+        1,
+        2,
+        10,
+        30,
+        100,
+        1000
+      ],
+      "overrides": {}
+    },
+    "enable_gapjunctions": {
+      "values": [
+        true,
+        false
+      ],
+      "overrides": {
+        "n_cells": 30
+      }
+    },
+    "g_CaL": {
+      "values": [
+        0.7,
+        1.8,
+        2.0
+      ],
+      "overrides": {
+        "n_cells": 1
+      }
+    },
+    "I_pulse10ms": {
+      "values": [
+        2.0,
+        5.0,
+        8.0,
+        10.0
+      ],
+      "overrides": {}
+    }
+  },
+  "environment": {
+    "python": "3.12.3",
+    "numpy": "2.4.4",
+    "platform": "Linux-6.17.0-1017-aws-x86_64-with-glibc2.39",
+    "processor": "x86_64"
+  },
+  "results": [
+    {
+      "swept_param": "n_cells",
+      "swept_value": 1,
+      "sim_seconds": 1.0,
+      "delta": 0.01,
+      "n_cells": 1,
+      "enable_gapjunctions": true,
+      "I_pulse10ms": 2.0,
+      "g_CaL": null,
+      "n_simsteps": 100000,
+      "total_cell_steps": 100000,
+      "wall_time_s": 20.812153624000075,
+      "cpu_time_s": 20.804779917,
+      "throughput_steps_per_s": 4804.884771015836,
+      "throughput_cellsteps_per_s": 4804.884771015836,
+      "latency_us_per_step": 208.12153624000075,
+      "latency_us_per_cellstep": 208.12153624000075,
+      "realtime_factor": 0.04804884771015836,
+      "repeats": 1,
+      "wall_time_mean_s": 20.812153624000075,
+      "wall_time_std_s": 0.0,
+      "status": "ok"
+    },
+    {
+      "swept_param": "n_cells",
+      "swept_value": 2,
+      "sim_seconds": 1.0,
+      "delta": 0.01,
+      "n_cells": 2,
+      "enable_gapjunctions": true,
+      "I_pulse10ms": 2.0,
+      "g_CaL": null,
+      "n_simsteps": 100000,
+      "total_cell_steps": 200000,
+      "wall_time_s": 20.854146088999983,
+      "cpu_time_s": 20.851476519000002,
+      "throughput_steps_per_s": 4795.2095268358835,
+      "throughput_cellsteps_per_s": 9590.419053671767,
+      "latency_us_per_step": 208.54146088999983,
+      "latency_us_per_cellstep": 104.27073044499991,
+      "realtime_factor": 0.047952095268358835,
+      "repeats": 1,
+      "wall_time_mean_s": 20.854146088999983,
+      "wall_time_std_s": 0.0,
+      "status": "ok"
+    },
+    {
+      "swept_param": "n_cells",
+      "swept_value": 10,
+      "sim_seconds": 1.0,
+      "delta": 0.01,
+      "n_cells": 10,
+      "enable_gapjunctions": true,
+      "I_pulse10ms": 2.0,
+      "g_CaL": null,
+      "n_simsteps": 100000,
+      "total_cell_steps": 1000000,
+      "wall_time_s": 24.19115172699992,
+      "cpu_time_s": 24.18769671900001,
+      "throughput_steps_per_s": 4133.742829961638,
+      "throughput_cellsteps_per_s": 41337.428299616375,
+      "latency_us_per_step": 241.9115172699992,
+      "latency_us_per_cellstep": 24.19115172699992,
+      "realtime_factor": 0.041337428299616376,
+      "repeats": 1,
+      "wall_time_mean_s": 24.19115172699992,
+      "wall_time_std_s": 0.0,
+      "status": "ok"
+    },
+    {
+      "swept_param": "n_cells",
+      "swept_value": 30,
+      "sim_seconds": 1.0,
+      "delta": 0.01,
+      "n_cells": 30,
+      "enable_gapjunctions": true,
+      "I_pulse10ms": 2.0,
+      "g_CaL": null,
+      "n_simsteps": 100000,
+      "total_cell_steps": 3000000,
+      "wall_time_s": 24.308568128999923,
+      "cpu_time_s": 24.30506098100001,
+      "throughput_steps_per_s": 4113.7758287252145,
+      "throughput_cellsteps_per_s": 123413.27486175644,
+      "latency_us_per_step": 243.08568128999923,
+      "latency_us_per_cellstep": 8.102856042999974,
+      "realtime_factor": 0.04113775828725215,
+      "repeats": 1,
+      "wall_time_mean_s": 24.308568128999923,
+      "wall_time_std_s": 0.0,
+      "status": "ok"
+    },
+    {
+      "swept_param": "n_cells",
+      "swept_value": 100,
+      "sim_seconds": 1.0,
+      "delta": 0.01,
+      "n_cells": 100,
+      "enable_gapjunctions": true,
+      "I_pulse10ms": 2.0,
+      "g_CaL": null,
+      "n_simsteps": 100000,
+      "total_cell_steps": 10000000,
+      "wall_time_s": 25.12373295100008,
+      "cpu_time_s": 25.120253409,
+      "throughput_steps_per_s": 3980.300228275567,
+      "throughput_cellsteps_per_s": 398030.0228275567,
+      "latency_us_per_step": 251.2373295100008,
+      "latency_us_per_cellstep": 2.512373295100008,
+      "realtime_factor": 0.03980300228275567,
+      "repeats": 1,
+      "wall_time_mean_s": 25.12373295100008,
+      "wall_time_std_s": 0.0,
+      "status": "ok"
+    },
+    {
+      "swept_param": "n_cells",
+      "swept_value": 1000,
+      "sim_seconds": 1.0,
+      "delta": 0.01,
+      "n_cells": 1000,
+      "enable_gapjunctions": true,
+      "I_pulse10ms": 2.0,
+      "g_CaL": null,
+      "n_simsteps": 100000,
+      "total_cell_steps": 100000000,
+      "wall_time_s": 45.83652959299991,
+      "cpu_time_s": 45.830024893,
+      "throughput_steps_per_s": 2181.6660399017615,
+      "throughput_cellsteps_per_s": 2181666.0399017613,
+      "latency_us_per_step": 458.3652959299991,
+      "latency_us_per_cellstep": 0.4583652959299991,
+      "realtime_factor": 0.021816660399017612,
+      "repeats": 1,
+      "wall_time_mean_s": 45.83652959299991,
+      "wall_time_std_s": 0.0,
+      "status": "ok"
+    }
+  ]
+}
